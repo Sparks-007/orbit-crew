@@ -1,0 +1,47 @@
+# Orbit Crew — production-parity stack.
+#
+# Note: the schema currently targets SQLite in the sandbox; switch provider
+# per docs/architecture/database.md before using this stack.
+#
+# Prerequisites:
+#   1. AUTH_SECRET must be set in a .env file next to this compose file:
+#        openssl rand -base64 32
+#   2. Run migrations against the db service before first start:
+#        DATABASE_URL=postgres://orbit:orbit@db:5432/orbit_crew bunx prisma migrate deploy
+#      (after the provider switch; see docs/architecture/database.md)
+#   3. Change the database credentials for any real deployment.
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: orbit
+      POSTGRES_PASSWORD: orbit
+      POSTGRES_DB: orbit_crew
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orbit -d orbit_crew"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  web:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://orbit:orbit@db:5432/orbit_crew
+      AUTH_SECRET: ${AUTH_SECRET:?set in .env}
+      APP_URL: ${APP_URL:-http://localhost:3000}
+      NODE_ENV: production
+    ports:
+      - "3000:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:

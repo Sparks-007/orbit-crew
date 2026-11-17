@@ -32,6 +32,13 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+!.env.example
+
+# runtime database (sandbox sqlite)
+/db
+
+# sandbox runtime tooling and state
+/.zscripts
 
 # vercel
 .vercel

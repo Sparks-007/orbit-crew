@@ -1,0 +1,19 @@
+# CI — quality gates for the M1 foundation.
+# Production builds and the test suite are added in later milestones;
+# no `next build` runs in this environment yet.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install
+      - run: bun run lint
+      - run: bun run typecheck
