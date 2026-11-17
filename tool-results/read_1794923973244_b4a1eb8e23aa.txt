@@ -1,0 +1,941 @@
+     1→import { presentationSchema, presentationText } from '../shared/presentation.ts';
+     2→import {
+     3→  answerChoicesSchema,
+     4→  questionAnswerSchema,
+     5→  writtenAnswer,
+     6→  type AnswerChoice,
+     7→} from '../shared/answer-choices.ts';
+     8→import { approvalContent, approvalTitle } from './action-presentation.ts';
+     9→import Fastify, { type FastifyReply } from 'fastify';
+    10→import multipart from '@fastify/multipart';
+    11→import rateLimit from '@fastify/rate-limit';
+    12→import { randomUUID } from 'node:crypto';
+    13→import type { PoolClient } from 'pg';
+    14→import type { SpeechService } from './speech.ts';
+    15→import { messageInput, registerAudioMessages } from './audio-messages.ts';
+    16→import { messageTooLongError } from '../shared/message-limits.ts';
+    17→import type { ServerResponse } from 'node:http';
+    18→import { z } from 'zod';
+    19→import { pool } from './db.ts';
+    20→import {
+    21→  accessOrigin,
+    22→  authToken,
+    23→  configuration,
+    24→  dataRoot,
+    25→  desktopAccess,
+    26→  ownerId,
+    27→  port,
+    28→} from './config.ts';
+    29→import { events, type ServerEvent } from './events.ts';
+    30→import { artifactView, localArtifacts, type ArtifactService } from './artifacts.ts';
+    31→import {
+    32→  activeHandoffSql,
+    33→  activeThread,
+    34→  ownerStarted,
+    35→  pendingAnswerChoicesSql,
+    36→  reactToAssistantMessage,
+    37→  resetThread,
+    38→  resumeAfterHandoff,
+    39→  stopSignal,
+    40→  stopThread,
+    41→  submitUserMessage,
+    42→} from './thread.ts';
+    43→import { isMessageReaction } from '../shared/emoji.ts';
+    44→import { accessKey, registerLocalAccess } from './access.ts';
+    45→import { logFailure, withFailureLog, type FailureLogSink } from './failure-log.ts';
+    46→import { fileBytes } from '../shared/files.ts';
+    47→import { BrowserActionError, type Computer } from '../ports/computer.ts';
+    48→import { browserErrorMessage } from '../shared/browser-errors.ts';
+    49→import { browserHandoffInputs } from '../shared/browser-handoff.ts';
+    50→import type {
+    51→  Activity,
+    52→  ApprovalState,
+    53→  Configuration,
+    54→  Message,
+    55→  MessageHistoryPage,
+    56→  MessageReaction,
+    57→  Turn,
+    58→} from '../shared/contracts.ts';
+    59→import type { createChatVerification } from './chat-verification.ts';
+    60→import { registerWorkAdmission, type WorkAdmission } from './work-admission.ts';
+    61→import { registerAnalyticsRoutes, snapshotAnalytics, type CaptureAnalytics } from './analytics.ts';
+    62→import { messagePreview } from './message-preview.ts';
+    63→
+    64→const reactionReplySql = (alias: 'm' | 'target') =>
+    65→  `EXISTS (SELECT 1 FROM turns reaction_turn
+    66→    WHERE reaction_turn.owner_id=${alias}.owner_id AND reaction_turn.message_id=${alias}.id
+    67→      AND starts_with(reaction_turn.source_id,'reaction-reply:'))`;
+    68→const messageFields = `m.id,m.role,m.text,CASE WHEN m.role='user' THEN m.display_text END AS "displayText",m.audio_caption AS "audioCaption",m.turn_id AS "turnId",m.created_at AS "createdAt",m.attachments,m.stream_id AS "streamId",m.reaction,m.assistant_reaction AS "assistantReaction",m.reply_to_message_id AS "replyToMessageId",m.suggestions,m.presentation,m.answer_choices AS "answerChoices",(${pendingAnswerChoicesSql}) AS "answerChoicesPending",
+    69→ (m.role='user' AND (m.approval_answer IS NOT NULL OR (m.question_answer IS NOT NULL AND m.text<>'' AND jsonb_array_length(m.attachments)=0))) AS "cardAnswer",
+    70→ CASE WHEN m.role='assistant' AND m.answer_choices IS NOT NULL THEN (SELECT json_build_object('answer',a.question_answer,'text',a.text) FROM messages a
+    71→   WHERE a.reply_to_message_id=m.id AND a.owner_id=m.owner_id AND a.role='user' AND a.question_answer IS NOT NULL AND a.text<>'' AND jsonb_array_length(a.attachments)=0 ORDER BY a.created_at,a.id LIMIT 1) END AS "choiceAnswer",
+    72→ CASE WHEN m.role='assistant' THEN (SELECT json_build_object('id',a.id,'status',a.status,'action',a.action,'title',a.title,'args',a.args,'active',u.status IN ('running','waiting'),'executionActive',e.status IN ('queued','running','waiting')) FROM approvals a
+    73→   JOIN turns u ON u.id=a.turn_id AND u.owner_id=a.owner_id LEFT JOIN turns e ON e.id=a.execution_turn_id AND e.owner_id=a.owner_id
+    74→   WHERE a.confirmation_message_id=m.id AND a.owner_id=m.owner_id LIMIT 1) END AS "approval",
+    75→ CASE WHEN m.role='assistant' AND (m.answer_choices IS NOT NULL OR EXISTS (SELECT 1 FROM approvals a WHERE a.confirmation_message_id=m.id AND a.owner_id=m.owner_id))
+    76→   THEN (SELECT COALESCE(
+    77→     (SELECT json_build_object('kind','task','id',k.id,'title',k.title) FROM tasks k WHERE k.owner_id=m.owner_id AND k.session_id=w.session_id ORDER BY k.created_at DESC LIMIT 1),
+    78→     (SELECT json_build_object('kind','schedule','id',r.id,'title',r.title) FROM schedule_runs r WHERE r.owner_id=m.owner_id AND r.turn_id=w.session_id LIMIT 1))
+    79→     FROM turns w WHERE w.id=m.turn_id AND w.owner_id=m.owner_id) END AS "work",
+    80→ CASE WHEN target.id IS NULL OR ${reactionReplySql('target')} THEN NULL ELSE json_build_object('id',target.id,'role',target.role,'text',COALESCE(m.reply_quote,''),'isQuote',m.reply_quote IS NOT NULL) END AS "replyTo"`;
+    81→const chatMessageSql = `NOT ${reactionReplySql('m')}`;
+    82→const textMessageOptions = {
+    83→  bodyLimit: 8 * 1024 * 1024,
+    84→  config: { rateLimit: { max: 120, timeWindow: '1 minute' } },
+    85→};
+    86→function visualText(presentation: unknown) {
+    87→  const visual = presentationSchema.safeParse(presentation);
+    88→  return visual.success ? presentationText(visual.data) : '';
+    89→}
+    90→
+    91→type ApprovalRow = {
+    92→  id: string;
+    93→  status: string;
+    94→  action: string;
+    95→  args: unknown;
+    96→  title?: string | null;
+    97→  active: boolean;
+    98→  executionActive: boolean | null;
+    99→};
+   100→type ChoiceAnswerRow = { answer: unknown; text: string };
+   101→
+   102→function approvalState(row: ApprovalRow): ApprovalState {
+   103→  if (row.status === 'pending') return row.active ? 'pending' : 'expired';
+   104→  if (row.status === 'confirmed') return row.executionActive ? 'working' : 'expired';
+   105→  if (row.status === 'executing') return row.executionActive ? 'working' : 'uncertain';
+   106→  if (row.status === 'completed') return 'done';
+   107→  if (row.status === 'declined' || row.status === 'uncertain') return row.status;
+   108→  return 'expired';
+   109→}
+   110→
+   111→function choiceAnswerView(options: AnswerChoice[], row: ChoiceAnswerRow | null | undefined) {
+   112→  const answer = questionAnswerSchema.safeParse(row?.answer);
+   113→  if (!row || !answer.success) return undefined;
+   114→  if (!('choiceIds' in answer.data)) return { choiceIds: [], text: row.text };
+   115→  const { choiceIds, custom } = answer.data;
+   116→  const text =
+   117→    custom &&
+   118→    writtenAnswer(
+   119→      options.filter((option) => choiceIds.includes(option.id)),
+   120→      row.text,
+   121→    );
+   122→  return { choiceIds, ...(text ? { text } : {}) };
+   123→}
+   124→
+   125→type MessageRow = Omit<Message, 'approval' | 'choiceAnswer' | 'cardAnswer' | 'work'> & {
+   126→  work?: Message['work'] | null;
+   127→  assistantReaction?: MessageReaction | null;
+   128→  approval?: ApprovalRow | null;
+   129→  choiceAnswer?: ChoiceAnswerRow | null;
+   130→  cardAnswer?: boolean | null;
+   131→};
+   132→
+   133→function messageView(row: MessageRow): Message {
+   134→  const {
+   135→    assistantReaction,
+   136→    presentation,
+   137→    displayText,
+   138→    audioCaption,
+   139→    answerChoices,
+   140→    answerChoicesPending,
+   141→    approval,
+   142→    choiceAnswer,
+   143→    cardAnswer,
+   144→    work,
+   145→    ...message
+   146→  } = row;
+   147→  const visual =
+   148→    message.role === 'assistant' ? presentationSchema.safeParse(presentation) : undefined;
+   149→  const choices =
+   150→    message.role === 'assistant' ? answerChoicesSchema.safeParse(answerChoices) : undefined;
+   151→  const answered = choices?.success
+   152→    ? choiceAnswerView(choices.data.options, choiceAnswer)
+   153→    : undefined;
+   154→  return {
+   155→    ...message,
+   156→    ...(message.role === 'user' && typeof displayText === 'string' ? { displayText } : {}),
+   157→    ...(typeof audioCaption === 'string' ? { audioCaption } : {}),
+   158→    ...(visual?.success ? { presentation: visual.data } : {}),
+   159→    ...(choices?.success
+   160→      ? { answerChoices: choices.data, answerChoicesPending: answerChoicesPending === true }
+   161→      : {}),
+   162→    ...(answered ? { choiceAnswer: answered } : {}),
+   163→    ...(approval
+   164→      ? {
+   165→          approval: {
+   166→            id: approval.id,
+   167→            state: approvalState(approval),
+   168→            ...approvalTitle(approval.action),
+   169→            ...(approval.title ? { title: approval.title } : {}),
+   170→            ...approvalContent(approval.action, approval.args),
+   171→          },
+   172→        }
+   173→      : {}),
+   174→    ...(cardAnswer ? { cardAnswer: true as const } : {}),
+   175→    ...(work ? { work } : {}),
+   176→    reactions: [
+   177→      ...(message.reaction ? [{ actor: 'user' as const, reaction: message.reaction }] : []),
+   178→      ...(assistantReaction ? [{ actor: 'assistant' as const, reaction: assistantReaction }] : []),
+   179→    ],
+   180→  };
+   181→}
+   182→
+   183→export interface AppDependencies {
+   184→  failureLog?: FailureLogSink;
+   185→  analytics?: CaptureAnalytics;
+   186→  admission?: WorkAdmission;
+   187→  artifacts?: ArtifactService;
+   188→  speech?: SpeechService;
+   189→  attributeAudioUsage?: (client: PoolClient, ids: string[], turnId: string) => Promise<void>;
+   190→  submitMessage?: typeof submitUserMessage;
+   191→  reactToMessage?: (
+   192→    messageId: string,
+   193→    reaction: MessageReaction | null,
+   194→    wake: boolean,
+   195→    replyChannel: string,
+   196→  ) => ReturnType<typeof reactToAssistantMessage>;
+   197→  verification?: Awaited<ReturnType<typeof createChatVerification>>;
+   198→  computer?: Pick<
+   199→    Computer,
+   200→    'act' | 'screenshot' | 'control' | 'view' | 'screenStatus' | 'clear' | 'discard'
+   201→  >;
+   202→  configuration?: () => Configuration;
+   203→  onboard?: (timeZone?: string, threadId?: string) => Promise<unknown>;
+   204→  taskLedger?: () => Promise<import('../shared/contracts.ts').Task[]>;
+   205→  activity?: () => Promise<Activity[]>;
+   206→  planningTasks?: () => string | undefined;
+   207→}
+   208→
+   209→export async function createApp(dependencies: AppDependencies = {}) {
+   210→  const publicConfiguration = dependencies.configuration ?? configuration;
+   211→  const artifacts = dependencies.artifacts ?? localArtifacts;
+   212→  async function messageViews(rows: MessageRow[]) {
+   213→    const replyIds = [
+   214→      ...new Set(
+   215→        rows.flatMap((row) => (row.replyTo && !row.replyTo.isQuote ? [row.replyTo.id] : [])),
+   216→      ),
+   217→    ];
+   218→    const targets = replyIds.length
+   219→      ? await pool.query<{ id: string; role: string; text: string; presentation: unknown }>(
+   220→          "SELECT id,role,COALESCE(CASE WHEN role='user' THEN display_text END,audio_caption,text) AS text,presentation FROM messages WHERE owner_id=$1 AND id=ANY($2::uuid[]) AND hidden_at IS NULL",
+   221→          [ownerId, replyIds],
+   222→        )
+   223→      : { rows: [] };
+   224→    const previews = new Map(
+   225→      targets.rows.map((target) => [
+   226→        target.id,
+   227→        messagePreview(
+   228→          target.text.trim() || target.role !== 'assistant'
+   229→            ? target.text
+   230→            : visualText(target.presentation),
+   231→        ),
+   232→      ]),
+   233→    );
+   234→    return rows.map((message) =>
+   235→      messageView(
+   236→        message.replyTo && !message.replyTo.isQuote
+   237→          ? {
+   238→              ...message,
+   239→              replyTo: { ...message.replyTo, text: previews.get(message.replyTo.id) ?? '' },
+   240→            }
+   241→          : message,
+   242→      ),
+   243→    );
+   244→  }
+   245→  const app = Fastify({
+   246→    logger: false,
+   247→    bodyLimit: 256 * 1024,
+   248→    requestTimeout: 300_000,
+   249→    trustProxy: false,
+   250→    forceCloseConnections: true,
+   251→  });
+   252→  const streams = new Set<ServerResponse>();
+   253→  const browserFrameAcks = new Map<
+   254→    string,
+   255→    { turnId: string; browserId: string; acknowledge(): void }
+   256→  >();
+   257→  if (dependencies.failureLog)
+   258→    app.addHook('onRequest', (_request, _reply, done) =>
+   259→      withFailureLog(dependencies.failureLog!, done),
+   260→    );
+   261→  if (dependencies.analytics) registerAnalyticsRoutes(app, dependencies.analytics);
+   262→  app.addHook('preClose', async () => {
+   263→    for (const stream of streams) stream.end();
+   264→  });
+   265→  registerLocalAccess(
+   266→    app,
+   267→    port,
+   268→    desktopAccess
+   269→      ? { key: desktopAccess.token, desktop: true }
+   270→      : {
+   271→          key: authToken ?? (await accessKey(dataRoot)),
+   272→          origin: accessOrigin,
+   273→          bearer: authToken !== undefined,
+   274→        },
+   275→  );
+   276→  if (desktopAccess && dependencies.admission) registerWorkAdmission(app, dependencies.admission);
+   277→  app.setErrorHandler((error, request, reply) => {
+   278→    const known =
+   279→      error instanceof Error
+   280→        ? (error as Error & { statusCode?: number; retryable?: boolean; code?: string })
+   281→        : undefined;
+   282→    const status = error instanceof z.ZodError ? 400 : known?.statusCode || 500;
+   283→    const messageTooLong =
+   284→      (request.routeOptions.url === '/api/messages' ||
+   285→        request.routeOptions.url === '/api/messages/audio') &&
+   286→      (known?.code === 'message_too_long' ||
+   287→        (error instanceof z.ZodError &&
+   288→          error.issues.some(
+   289→            (issue) =>
+   290→              issue.code === 'too_big' && issue.path.length === 1 && issue.path[0] === 'text',
+   291→          )));
+   292→    if (status >= 500)
+   293→      logFailure('request_failed', error, {
+   294→        method: request.method,
+   295→        operation: request.routeOptions.url?.split('/').filter(Boolean).join(' '),
+   296→        status,
+   297→      });
+   298→    reply.code(status).send({
+   299→      ...(known?.retryable === true ? { retryable: true } : {}),
+   300→      ...(status === 409 && known?.code === 'question_unavailable'
+   301→        ? { code: 'question_unavailable' }
+   302→        : {}),
+   303→      ...(messageTooLong ? { code: 'message_too_long' } : {}),
+   304→      error: messageTooLong
+   305→        ? messageTooLongError
+   306→        : error instanceof z.ZodError
+   307→          ? 'Check the supplied values.'
+   308→          : status < 500
+   309→            ? known?.message
+   310→            : 'This request could not be completed. Check the local service and try again.',
+   311→    });
+   312→  });
+   313→  await app.register(rateLimit, {
+   314→    global: false,
+   315→    keyGenerator: () => ownerId,
+   316→  });
+   317→  await app.register(multipart, { limits: { fileSize: fileBytes, files: 1, fields: 5 } });
+   318→  const audioMessages = registerAudioMessages(app, dependencies);
+   319→  app.get('/api/health', async () => {
+   320→    await pool.query('SELECT 1');
+   321→    return { ok: true };
+   322→  });
+   323→  if (desktopAccess)
+   324→    app.get('/api/desktop/status', async () => {
+   325→      const result = await pool.query<{ source: string; visible: boolean; task: boolean }>(
+   326→        `SELECT u.source,${ownerStarted()} AS visible,to_jsonb(u)->>'task_id' IS NOT NULL AS task
+   327→         FROM turns u WHERE u.owner_id=$1 AND u.status='running'`,
+   328→        [ownerId],
+   329→      );
+   330→      return { running: result.rows };
+   331→    });
+   332→  const turnFields = `u.id,u.status,u.source,u.error,u.created_at AS "createdAt",u.finished_at AS "finishedAt",
+   333→    CASE WHEN ${activeHandoffSql}
+   334→      THEN (SELECT m.id FROM messages m WHERE m.turn_id=u.id AND m.owner_id=u.owner_id AND m.role='assistant' ORDER BY m.created_at DESC,m.id DESC LIMIT 1) END AS "handoffMessageId"`;
+   335→  async function messageTurns(threadId: string, ids: string[]): Promise<Turn[]> {
+   336→    if (!ids.length) return [];
+   337→    const result = await pool.query(
+   338→      `SELECT ${turnFields} FROM turns u WHERE u.owner_id=$1 AND u.thread_id=$2 AND u.id=ANY($3::uuid[])`,
+   339→      [ownerId, threadId, [...new Set(ids)]],
+   340→    );
+   341→    return result.rows;
+   342→  }
+   343→  app.get('/api/configuration', async () => publicConfiguration());
+   344→  app.get('/api/state', async () => {
+   345→    const thread = await activeThread(pool);
+   346→    const messageRows = pool.query(
+   347→      `SELECT ${messageFields} FROM (SELECT m.* FROM messages m WHERE m.owner_id=$1 AND m.thread_id=$2 AND m.hidden_at IS NULL AND ${chatMessageSql} ORDER BY date_trunc('milliseconds',m.created_at) DESC,m.id DESC LIMIT 151) m
+   348→         LEFT JOIN messages target ON target.id=m.reply_to_message_id AND target.owner_id=m.owner_id AND target.hidden_at IS NULL ORDER BY date_trunc('milliseconds',m.created_at),m.id`,
+   349→      [ownerId, thread.id],
+   350→    );
+   351→    const hiddenMetadata = messageRows.then(({ rows }) =>
+   352→      pool.query<{ count: number; ids: string[]; visibleIds: string[] }>(
+   353→        `SELECT
+   354→          (SELECT count(*)::int FROM messages WHERE owner_id=$1 AND thread_id=$2 AND hidden_at IS NOT NULL) AS count,
+   355→          ARRAY(SELECT id FROM messages WHERE owner_id=$1 AND thread_id=$2 AND hidden_at IS NOT NULL
+   356→            ORDER BY hidden_at DESC,id DESC LIMIT 150) AS ids,
+   357→          ARRAY(SELECT id FROM messages WHERE owner_id=$1 AND thread_id=$2
+   358→            AND id=ANY($3::uuid[]) AND hidden_at IS NULL) AS "visibleIds"`,
+   359→        [ownerId, thread.id, rows.map((message) => message.id)],
+   360→      ),
+   361→    );
+   362→    const [messages, hiddenMessages, turns, pendingChoices, verificationRequests, activity] =
+   363→      await Promise.all([
+   364→        messageRows,
+   365→        hiddenMetadata,
+   366→        pool.query(
+   367→          `SELECT ${turnFields} FROM turns u WHERE u.owner_id=$1 AND u.thread_id=$2 ORDER BY u.created_at DESC LIMIT 50`,
+   368→          [ownerId, thread.id],
+   369→        ),
+   370→        pool.query<{ id: string }>(
+   371→          `SELECT m.id FROM turns waiting JOIN LATERAL (
+   372→          SELECT m.* FROM messages m WHERE m.turn_id=waiting.id AND m.owner_id=waiting.owner_id
+   373→            AND m.thread_id=waiting.thread_id AND m.role='assistant' AND m.hidden_at IS NULL
+   374→          ORDER BY m.created_at DESC,m.id DESC LIMIT 1
+   375→        ) m ON true
+   376→        WHERE waiting.owner_id=$1 AND waiting.thread_id=$2 AND waiting.status='waiting'
+   377→          AND waiting.waiting_reason='question' AND ${pendingAnswerChoicesSql}`,
+   378→          [ownerId, thread.id],
+   379→        ),
+   380→        dependencies.verification?.pending() ?? [],
+   381→        dependencies.activity?.() ?? [],
+   382→      ]);
+   383→    const hasEarlierMessages = messages.rows.length > 150;
+   384→    const visibleIds = new Set(hiddenMessages.rows[0]!.visibleIds);
+   385→    const visibleMessages = messages.rows
+   386→      .slice(hasEarlierMessages ? 1 : 0)
+   387→      .filter((message) => visibleIds.has(message.id));
+   388→    const recentIds = new Set(turns.rows.map((turn) => turn.id));
+   389→    const olderTurns = await messageTurns(
+   390→      thread.id,
+   391→      visibleMessages.map((message) => message.turnId).filter((id) => id && !recentIds.has(id)),
+   392→    );
+   393→    const planning = dependencies.planningTasks?.();
+   394→    return {
+   395→      threadId: thread.id,
+   396→      tasks: await dependencies.taskLedger?.(),
+   397→      hasEarlierMessages,
+   398→      hiddenMessageCount: hiddenMessages.rows[0]!.count,
+   399→      hiddenMessageIds: hiddenMessages.rows[0]!.ids,
+   400→      pendingAnswerChoiceMessageIds: pendingChoices.rows.map(({ id }) => id),
+   401→      messages: await messageViews(visibleMessages),
+   402→      turns: [...turns.rows, ...olderTurns],
+   403→      activity,
+   404→      verificationRequests,
+   405→      planningTasks: planning !== undefined,
+   406→      ...(planning ? { planningStep: planning } : {}),
+   407→      configuration: publicConfiguration(),
+   408→    };
+   409→  });
+   410→  app.get('/api/messages/search', async (request) => {
+   411→    const { q } = z.object({ q: z.string().trim().min(1).max(200) }).parse(request.query);
+   412→    const thread = await activeThread(pool);
+   413→    const { rows } = await pool.query(
+   414→      `SELECT ${messageFields},ts_headline('english',m.text,websearch_to_tsquery('english',$3),'StartSel="", StopSel="", MaxWords=35, MinWords=15, ShortWord=0') AS snippet
+   415→       FROM messages m LEFT JOIN messages target ON target.id=m.reply_to_message_id AND target.owner_id=m.owner_id AND target.hidden_at IS NULL
+   416→       LEFT JOIN LATERAL (
+   417→         SELECT jsonb_path_query_array(m.presentation,'strict $.** ? (@.type() == "object").keyvalue() ? (@.key != "version" && @.key != "type" && @.key != "id" && @.key != "artifactId" && @.key != "sectionId" && @.key != "from" && @.key != "to" && @.key != "chart").value ? (@.type() == "string" || @.type() == "number")')
+   418→           || jsonb_path_query_array(m.presentation,'strict $.** ? (@.type() == "array")[*] ? (@.type() == "string" || @.type() == "number")') AS content
+   419→         WHERE m.role='assistant' AND m.presentation->>'version'='1'
+   420→       ) visual ON true
+   421→       WHERE m.owner_id=$1 AND m.thread_id=$2 AND m.hidden_at IS NULL AND ${chatMessageSql} AND (
+   422→         to_tsvector('english',m.text) @@ websearch_to_tsquery('english',$3) OR strpos(lower(m.text),lower($3))>0
+   423→         OR jsonb_to_tsvector('english',visual.content,'["string","numeric"]') @@ websearch_to_tsquery('english',$3)
+   424→         OR EXISTS (SELECT 1 FROM jsonb_array_elements_text(visual.content) value WHERE strpos(lower(value),lower($3))>0)
+   425→       ) ORDER BY m.created_at DESC,m.id DESC LIMIT 50`,
+   426→      [ownerId, thread.id, q],
+   427→    );
+   428→    const visualTexts = rows.flatMap((row) => {
+   429→      const fallback = row.role === 'assistant' ? visualText(row.presentation) : '';
+   430→      if (!fallback) return [];
+   431→      return [{ id: row.id, text: [row.text, fallback].filter(Boolean).join('\n\n') }];
+   432→    });
+   433→    const visualSnippets = new Map(
+   434→      (visualTexts.length
+   435→        ? (
+   436→            await pool.query<{ id: string; snippet: string }>(
+   437→              `SELECT id,ts_headline('english',text,websearch_to_tsquery('english',$2),'StartSel="", StopSel="", MaxWords=35, MinWords=15, ShortWord=0') AS snippet
+   438→             FROM jsonb_to_recordset($1::jsonb) AS content(id text,text text)`,
+   439→              [JSON.stringify(visualTexts), q],
+   440→            )
+   441→          ).rows
+   442→        : []
+   443→      ).map((row) => [row.id, row.snippet]),
+   444→    );
+   445→    const messages = await messageViews(rows);
+   446→    return messages.map((message, index) => ({
+   447→      ...message,
+   448→      snippet: visualSnippets.get(message.id) ?? (rows[index].snippet as string),
+   449→    }));
+   450→  });
+   451→  app.get('/api/messages/around/:id', async (request) => {
+   452→    const { id } = z.object({ id: z.uuid() }).parse(request.params);
+   453→    const thread = await activeThread(pool);
+   454→    const hit = (
+   455→      await pool.query(
+   456→        `SELECT m.created_at FROM messages m WHERE m.id=$1 AND m.owner_id=$2 AND m.thread_id=$3 AND m.hidden_at IS NULL AND ${chatMessageSql}`,
+   457→        [id, ownerId, thread.id],
+   458→      )
+   459→    ).rows[0];
+   460→    if (!hit) throw Object.assign(new Error('Message not found.'), { statusCode: 404 });
+   461→    const { rows } = await pool.query(
+   462→      `SELECT ${messageFields} FROM messages m LEFT JOIN messages target ON target.id=m.reply_to_message_id AND target.owner_id=m.owner_id AND target.hidden_at IS NULL WHERE m.owner_id=$1 AND m.thread_id=$2 AND m.hidden_at IS NULL AND ${chatMessageSql} AND m.created_at BETWEEN $3::timestamptz-interval '1 day' AND $3::timestamptz+interval '1 day' ORDER BY (m.id=$4) DESC,abs(extract(epoch FROM m.created_at-$3::timestamptz)),m.id LIMIT 60`,
+   463→      [ownerId, thread.id, hit.created_at, id],
+   464→    );
+   465→    return messageViews(rows);
+   466→  });
+   467→  app.get('/api/messages', async (request) => {
+   468→    const query = z
+   469→      .object({
+   470→        before: z.iso.datetime({ offset: true }).optional(),
+   471→        beforeId: z.uuid().optional(),
+   472→        threadId: z.uuid().optional(),
+   473→      })
+   474→      .parse(request.query);
+   475→    const thread = await activeThread(pool);
+   476→    if (query.threadId !== undefined && query.threadId !== thread.id)
+   477→      throw Object.assign(
+   478→        new Error('This conversation has been reset. Reload it before continuing.'),
+   479→        { statusCode: 409 },
+   480→      );
+   481→    const rows = await pool.query(
+   482→      `SELECT ${messageFields} FROM messages m
+   483→      LEFT JOIN messages target ON target.id=m.reply_to_message_id AND target.owner_id=m.owner_id AND target.hidden_at IS NULL
+   484→      WHERE m.owner_id=$1 AND m.thread_id=$4 AND m.hidden_at IS NULL AND ${chatMessageSql} AND ($2::timestamptz IS NULL OR date_trunc('milliseconds',m.created_at) < $2 OR (date_trunc('milliseconds',m.created_at) = $2 AND $3::uuid IS NOT NULL AND m.id < $3))
+   485→      ORDER BY date_trunc('milliseconds',m.created_at) DESC,m.id DESC LIMIT 61`,
+   486→      [ownerId, query.before ?? null, query.beforeId ?? null, thread.id],
+   487→    );
+   488→    const page = rows.rows.slice(0, 60);
+   489→    return {
+   490→      messages: await messageViews(page.reverse()),
+   491→      hasMore: rows.rows.length > 60,
+   492→    } satisfies MessageHistoryPage;
+   493→  });
+   494→  app.post<{ Params: { id: string } }>('/api/messages/:id/reaction', async (request) => {
+   495→    const { reaction } = z
+   496→      .object({ reaction: z.string().max(64).refine(isMessageReaction).nullable() })
+   497→      .strict()
+   498→      .parse(request.body);
+   499→    const react =
+   500→      dependencies.reactToMessage ??
+   501→      ((id: string, value: MessageReaction | null, wake: boolean, channel: string) =>
+   502→        reactToAssistantMessage(id, value, wake, undefined, channel));
+   503→    return react(
+   504→      z.uuid().parse(request.params.id),
+   505→      reaction,
+   506→      publicConfiguration().llmReady,
+   507→      'web',
+   508→    );
+   509→  });
+   510→  app.post('/api/conversation/reset', async (request, reply) => {
+   511→    const capture = snapshotAnalytics(dependencies.analytics);
+   512→    if (!configuration().conversationResetEnabled)
+   513→      return reply.code(404).send({ error: 'Not found.' });
+   514→    const { threadId } = z.object({ threadId: z.uuid() }).strict().parse(request.body);
+   515→    return audioMessages.pause(async () => {
+   516→      const { previousThreadId, browsers, ...reset } = await resetThread(threadId, capture);
+   517→      for (const id of [previousThreadId, ...browsers])
+   518→        void dependencies.computer?.discard(id).catch(() => {});
+   519→      return reset;
+   520→    }, threadId);
+   521→  });
+   522→  app.post('/api/messages', textMessageOptions, async (request) => {
+   523→    const arrival = stopSignal();
+   524→    const input = messageInput
+   525→      .refine((value) => value.text.length > 0 || value.attachmentIds.length > 0)
+   526→      .refine(
+   527→        (value) =>
+   528→          !value.questionAnswer ||
+   529→          (Boolean(value.replyToMessageId) && !value.verificationRequestId),
+   530→      )
+   531→      .refine(
+   532→        (value) =>
+   533→          !value.approvalAnswer ||
+   534→          (Boolean(value.replyToMessageId) &&
+   535→            !value.questionAnswer &&
+   536→            !value.verificationRequestId &&
+   537→            value.attachmentIds.length === 0),
+   538→      )
+   539→      .parse(request.body);
+   540→    const clientMessageId = input.clientMessageId ?? randomUUID();
+   541→    const verification =
+   542→      (input.questionAnswer && !('custom' in input.questionAnswer)) || input.approvalAnswer
+   543→        ? undefined
+   544→        : await dependencies.verification?.accept(input.text, {
+   545→            ...input,
+   546→            clientMessageId,
+   547→            channel: 'web',
+   548→          });
+   549→    if (verification) return verification;
+   550→    if (input.verificationRequestId)
+   551→      throw Object.assign(new Error('This verification request is no longer available.'), {
+   552→        statusCode: 409,
+   553→      });
+   554→    if (!publicConfiguration().llmReady)
+   555→      throw Object.assign(
+   556→        new Error('Configure an agent provider before starting a conversation.'),
+   557→        { statusCode: 503 },
+   558→      );
+   559→    const result = await pool.query(
+   560→      'SELECT * FROM artifacts WHERE id=ANY($1::uuid[]) AND owner_id=$2 AND deleting_at IS NULL',
+   561→      [input.attachmentIds, ownerId],
+   562→    );
+   563→    if (result.rowCount !== input.attachmentIds.length)
+   564→      throw Object.assign(new Error('An attachment is unavailable.'), { statusCode: 400 });
+   565→    const submitted = await (dependencies.submitMessage ?? submitUserMessage)(
+   566→      input.text,
+   567→      input.attachmentIds.map((id) =>
+   568→        artifactView(result.rows.find((artifact) => artifact.id === id)!),
+   569→      ),
+   570→      {
+   571→        channel: 'web',
+   572→        displayText: input.displayText,
+   573→        replyToMessageId: input.replyToMessageId,
+   574→        replyQuote: input.replyQuote,
+   575→        seenMessageId: input.seenMessageId,
+   576→        threadId: input.threadId,
+   577→        clientMessageId,
+   578→        questionAnswer: input.questionAnswer,
+   579→        approvalAnswer: input.approvalAnswer,
+   580→        stopSignal: arrival,
+   581→      },
+   582→    );
+   583→    return {
+   584→      ...submitted,
+   585→      ...(input.displayText !== undefined ? { displayText: input.displayText } : {}),
+   586→    };
+   587→  });
+   588→  app.post('/api/thread/stop', () => {
+   589→    const capture = snapshotAnalytics(dependencies.analytics);
+   590→    return audioMessages.pause(async () => {
+   591→      const { browsers } = await stopThread(capture);
+   592→      await Promise.allSettled(browsers.map((id) => dependencies.computer?.clear(id)));
+   593→      return { ok: true };
+   594→    });
+   595→  });
+   596→  app.get('/api/events', async (_request, reply) => {
+   597→    reply.hijack();
+   598→    streams.add(reply.raw);
+   599→    reply.raw.writeHead(200, {
+   600→      'Content-Type': 'text/event-stream',
+   601→      'Cache-Control': 'no-store',
+   602→      Connection: 'keep-alive',
+   603→      'X-Accel-Buffering': 'no',
+   604→    });
+   605→    const send = (event: ServerEvent) => {
+   606→      const payload =
+   607→        event.type === 'refresh'
+   608→          ? { type: 'refresh' }
+   609→          : event.type === 'activity' && event.ownerId === ownerId
+   610→            ? { type: 'activity', items: event.items }
+   611→            : event.type === 'delta' && event.ownerId === ownerId && event.channel === 'web'
+   612→              ? {
+   613→                  type: 'delta',
+   614→                  threadId: event.threadId,
+   615→                  turnId: event.turnId,
+   616→                  text: event.text,
+   617→                  streamId: event.streamId,
+   618→                  done: event.done,
+   619→                }
+   620→              : undefined;
+   621→      if (payload && !reply.raw.destroyed) reply.raw.write(`data: ${JSON.stringify(payload)}\n\n`);
+   622→    };
+   623→    send({ type: 'refresh' });
+   624→    events.on('event', send);
+   625→    const timer = setInterval(() => reply.raw.write(': keepalive\n\n'), 15000);
+   626→    reply.raw.on('close', () => {
+   627→      streams.delete(reply.raw);
+   628→      clearInterval(timer);
+   629→      events.off('event', send);
+   630→    });
+   631→  });
+   632→  app.post('/api/uploads', async (request) => {
+   633→    const file = await request.file();
+   634→    if (!file) throw Object.assign(new Error('Choose a file to upload.'), { statusCode: 400 });
+   635→    return artifacts.storeUpload(await file.toBuffer(), file.filename, file.mimetype);
+   636→  });
+   637→  app.post('/api/uploads/renew', async (request) => {
+   638→    const { ids } = z
+   639→      .object({ ids: z.array(z.uuid()).max(100) })
+   640→      .strict()
+   641→      .parse(request.body);
+   642→    return artifacts.renewUploads(ids);
+   643→  });
+   644→  app.get<{ Params: { id: string } }>('/api/artifacts/:id/metadata', async (request, reply) => {
+   645→    const { rows } = await pool.query(
+   646→      'SELECT * FROM artifacts WHERE id=$1 AND owner_id=$2 AND deleting_at IS NULL',
+   647→      [z.uuid().parse(request.params.id), ownerId],
+   648→    );
+   649→    if (!rows[0]) return reply.code(404).send({ error: 'File not found.' });
+   650→    return artifactView(rows[0]);
+   651→  });
+   652→  app.get<{ Params: { id: string } }>('/api/artifacts/:id', async (request, reply) => {
+   653→    const result = await pool.query(
+   654→      'SELECT * FROM artifacts WHERE id=$1 AND owner_id=$2 AND deleting_at IS NULL',
+   655→      [z.uuid().parse(request.params.id), ownerId],
+   656→    );
+   657→    const file = result.rows[0];
+   658→    if (!file) return reply.code(404).send({ error: 'File not found.' });
+   659→    const inline =
+   660→      /^(image\/(png|jpeg|webp|gif|avif|bmp|svg\+xml)|audio\/(mpeg|wav|x-wav|webm|ogg|mp4|aac|flac)|video\/(mp4|webm|ogg)|application\/pdf)$/.test(
+   661→        file.mime_type,
+   662→      );
+   663→    reply
+   664→      .header('Content-Type', file.mime_type)
+   665→      .header('Cache-Control', 'private, no-store')
+   666→      .header('X-Content-Type-Options', 'nosniff')
+   667→      .header('Accept-Ranges', 'bytes')
+   668→      .header(
+   669→        'Content-Disposition',
+   670→        `${inline ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(file.name)}`,
+   671→      )
+   672→      .header('Content-Security-Policy', "default-src 'none'; sandbox");
+   673→    const range = request.headers.range;
+   674→    if (range) {
+   675→      const match = /^bytes=(\d*)-(\d*)$/.exec(range);
+   676→      const start = match?.[1] ? Number(match[1]) : Math.max(0, file.size - Number(match?.[2]));
+   677→      const end =
+   678→        match?.[1] && match[2] ? Math.min(Number(match[2]), file.size - 1) : file.size - 1;
+   679→      if (
+   680→        !match ||
+   681→        (!match[1] && !match[2]) ||
+   682→        !Number.isSafeInteger(start) ||
+   683→        !Number.isSafeInteger(end) ||
+   684→        start < 0 ||
+   685→        start > end ||
+   686→        start >= file.size
+   687→      )
+   688→        return reply.code(416).header('Content-Range', `bytes */${file.size}`).send();
+   689→      return reply
+   690→        .code(206)
+   691→        .header('Content-Range', `bytes ${start}-${end}/${file.size}`)
+   692→        .header('Content-Length', end - start + 1)
+   693→        .send((await artifacts.readArtifact(file.id)).subarray(start, end + 1));
+   694→    }
+   695→    reply.header('Content-Length', file.size);
+   696→    return reply.send(await artifacts.readArtifact(file.id));
+   697→  });
+   698→  async function readCurrentBrowser() {
+   699→    const thread = await activeThread(pool);
+   700→    const latest = await pool.query(
+   701→      `SELECT left(COALESCE(m.text,u.prompt),100) AS title,u.status,COALESCE(e.created_at,u.created_at) AS "lastActivityAt"
+   702→       FROM turns u LEFT JOIN messages m ON m.id=u.message_id
+   703→       LEFT JOIN LATERAL (SELECT created_at FROM turn_events WHERE turn_id=u.id AND type IN ('tool_start','tool_complete') AND (summary='browser' OR summary LIKE 'browser %') ORDER BY created_at DESC LIMIT 1) e ON true
+   704→       WHERE u.owner_id=$1 AND u.thread_id=$2 AND u.session_id=$2 AND e.created_at IS NOT NULL
+   705→       ORDER BY e.created_at IS NULL,COALESCE(e.created_at,u.created_at) DESC LIMIT 1`,
+   706→      [ownerId, thread.id],
+   707→    );
+   708→    const row = latest.rows[0];
+   709→    if (!row) return undefined;
+   710→    return {
+   711→      threadId: thread.id,
+   712→      title: row.title,
+   713→      status: row.status,
+   714→      lastActivityAt: row.lastActivityAt,
+   715→    };
+   716→  }
+   717→  app.get('/api/browser', async () => ({ currentBrowser: (await readCurrentBrowser()) ?? null }));
+   718→  async function credentialEntryOpen(threadId: string) {
+   719→    const latest = await pool.query(
+   720→      "SELECT status,waiting_reason FROM turns WHERE owner_id=$1 AND thread_id=$2 AND session_id=$2 AND status<>'queued' ORDER BY created_at DESC,id DESC LIMIT 1",
+   721→      [ownerId, threadId],
+   722→    );
+   723→    return latest.rows[0]?.status === 'waiting' && latest.rows[0].waiting_reason === 'credentials';
+   724→  }
+   725→  async function handoffBrowser(turnId: string) {
+   726→    const latest = await pool.query(
+   727→      `SELECT u.handoff_browser_id FROM turns u
+   728→       JOIN threads th ON th.id=u.thread_id AND th.owner_id=u.owner_id
+   729→       WHERE u.owner_id=$1 AND u.id=$2 AND th.archived_at IS NULL AND ${activeHandoffSql}`,
+   730→      [ownerId, turnId],
+   731→    );
+   732→    return latest.rows[0]?.handoff_browser_id as string | undefined;
+   733→  }
+   734→  const handoffClosed = 'The browser opens here when Nod hands it to you.';
+   735→  async function readBrowserScreen(reply: FastifyReply) {
+   736→    const thread = await activeThread(pool);
+   737→    const blocked = () => credentialEntryOpen(thread.id);
+   738→    const paused = 'Browser observations are paused during credential entry.';
+   739→    if (await blocked()) return reply.code(423).send({ error: paused });
+   740→    let screen: Buffer | null | undefined;
+   741→    try {
+   742→      screen = await dependencies.computer?.screenshot(thread.id);
+   743→    } catch (error) {
+   744→      const message =
+   745→        error instanceof BrowserActionError ? browserErrorMessage(error.code) : undefined;
+   746→      if (message && error instanceof BrowserActionError)
+   747→        return reply.code(409).send({ code: error.code, error: message });
+   748→      throw error;
+   749→    }
+   750→    const current = await activeThread(pool);
+   751→    if (current.id !== thread.id)
+   752→      return reply.code(409).send({ error: 'The browser session changed. Request a new view.' });
+   753→    if (await blocked()) return reply.code(423).send({ error: paused });
+   754→    if (!screen) return reply.code(404).send({ error: 'There is no browser screen yet.' });
+   755→    const screenStatus = dependencies.computer?.screenStatus(thread.id);
+   756→    reply.header('X-Screen-State', screenStatus?.state ?? 'live');
+   757→    if (screenStatus?.capturedAt) reply.header('X-Screen-Captured-At', screenStatus.capturedAt);
+   758→    return reply.type('image/png').send(screen);
+   759→  }
+   760→  app.get('/api/browser/screen', (_request, reply) => readBrowserScreen(reply));
+   761→  app.get('/api/browser-handoff/stream', async (request, reply) => {
+   762→    const view = dependencies.computer?.view;
+   763→    if (!view) return reply.code(404).send({ error: 'The browser is unavailable.' });
+   764→    const { turnId, view: viewId } = z
+   765→      .object({ turnId: z.uuid(), view: z.string().min(1).max(120).optional() })
+   766→      .parse(request.query);
+   767→    const browserId = await handoffBrowser(turnId);
+   768→    if (!browserId) return reply.code(423).send({ error: handoffClosed });
+   769→    const controller = new AbortController();
+   770→    reply.raw.on('close', () => controller.abort());
+   771→    const open = () => view(browserId, controller.signal)[Symbol.asyncIterator]();
+   772→    let frames = open();
+   773→    let closed = false;
+   774→    let timedOut = false;
+   775→    const check = setInterval(
+   776→      () =>
+   777→        void handoffBrowser(turnId).then(
+   778→          (open) => {
+   779→            if (open === browserId) return;
+   780→            closed = true;
+   781→            controller.abort();
+   782→          },
+   783→          () => controller.abort(),
+   784→        ),
+   785→      1000,
+   786→    );
+   787→    async function firstFrame() {
+   788→      const opening = setTimeout(() => {
+   789→        timedOut = true;
+   790→        controller.abort();
+   791→      }, 10_000);
+   792→      let abortOpening = () => {};
+   793→      try {
+   794→        return await Promise.race([
+   795→          new Promise<IteratorResult<Buffer>>((resolve) => {
+   796→            abortOpening = () => resolve({ done: true, value: undefined });
+   797→            controller.signal.addEventListener('abort', abortOpening, { once: true });
+   798→            if (controller.signal.aborted) abortOpening();
+   799→          }),
+   800→          frames.next().catch(() => ({ done: true as const, value: undefined })),
+   801→        ]);
+   802→      } finally {
+   803→        clearTimeout(opening);
+   804→        controller.signal.removeEventListener('abort', abortOpening);
+   805→      }
+   806→    }
+   807→    try {
+   808→      let next = await firstFrame();
+   809→      if (closed) return reply.code(423).send({ error: handoffClosed });
+   810→      if (next.done)
+   811→        return reply.code(409).send({
+   812→          error: timedOut
+   813→            ? 'The browser view did not start. Try opening it again.'
+   814→            : "Nod's browser is not showing a page.",
+   815→        });
+   816→      if ((await handoffBrowser(turnId)) !== browserId)
+   817→        return reply.code(423).send({ error: handoffClosed });
+   818→      if (controller.signal.aborted) return;
+   819→      reply.hijack();
+   820→      streams.add(reply.raw);
+   821→      reply.raw.on('close', () => streams.delete(reply.raw));
+   822→      reply.raw.writeHead(200, {
+   823→        'Content-Type': 'application/octet-stream',
+   824→        'Cache-Control': 'no-store',
+   825→        'X-Content-Type-Options': 'nosniff',
+   826→        'X-Accel-Buffering': 'no',
+   827→      });
+   828→      while (!next.done && !controller.signal.aborted) {
+   829→        const length = Buffer.alloc(4);
+   830→        length.writeUInt32BE(next.value.length);
+   831→        let acknowledge: Promise<void> | undefined;
+   832→        if (viewId) {
+   833→          acknowledge = new Promise<void>((resolve) => {
+   834→            const finish = () => {
+   835→              if (browserFrameAcks.get(viewId)?.acknowledge === finish)
+   836→                browserFrameAcks.delete(viewId);
+   837→              controller.signal.removeEventListener('abort', finish);
+   838→              resolve();
+   839→            };
+   840→            browserFrameAcks.set(viewId, { turnId, browserId, acknowledge: finish });
+   841→            controller.signal.addEventListener('abort', finish, { once: true });
+   842→            if (controller.signal.aborted) finish();
+   843→          });
+   844→        }
+   845→        reply.raw.write(length);
+   846→        if (!reply.raw.write(next.value))
+   847→          await new Promise((resolve) => {
+   848→            reply.raw.once('drain', resolve);
+   849→            reply.raw.once('close', resolve);
+   850→          });
+   851→        await acknowledge;
+   852→        if (controller.signal.aborted) break;
+   853→        next = await frames.next();
+   854→        if (next.done && !controller.signal.aborted) {
+   855→          frames = open();
+   856→          next = await firstFrame();
+   857→        }
+   858→      }
+   859→    } catch (error) {
+   860→      if (!reply.raw.headersSent) throw error;
+   861→    } finally {
+   862→      clearInterval(check);
+   863→      controller.abort();
+   864→      void frames.return?.().catch(() => {});
+   865→      if (reply.raw.headersSent) reply.raw.end();
+   866→    }
+   867→  });
+   868→  app.post('/api/browser-handoff/frame-ack', async (request, reply) => {
+   869→    const { turnId, view } = z
+   870→      .object({ turnId: z.uuid(), view: z.string().min(1).max(120) })
+   871→      .strict()
+   872→      .parse(request.body);
+   873→    const pending = browserFrameAcks.get(view);
+   874→    if (!pending || pending.turnId !== turnId)
+   875→      return reply.code(409).send({ error: 'The browser frame is no longer waiting.' });
+   876→    if ((await handoffBrowser(turnId)) !== pending.browserId)
+   877→      return reply.code(423).send({ error: handoffClosed });
+   878→    pending.acknowledge();
+   879→    return { ok: true };
+   880→  });
+   881→  app.post('/api/browser-handoff', async (request, reply) => {
+   882→    const body = z
+   883→      .object({ turnId: z.uuid(), inputs: browserHandoffInputs })
+   884→      .strict()
+   885→      .safeParse(request.body);
+   886→    if (!body.success)
+   887→      return reply.code(400).send({ error: 'Send pointer, wheel, key, text or copy input.' });
+   888→    const control = dependencies.computer?.control;
+   889→    if (!control) return reply.code(404).send({ error: 'The browser is unavailable.' });
+   890→    const browserId = await handoffBrowser(body.data.turnId);
+   891→    if (!browserId) return reply.code(423).send({ error: handoffClosed });
+   892→    try {
+   893→      let copiedText: string | undefined;
+   894→      for (const input of body.data.inputs) {
+   895→        if ((await handoffBrowser(body.data.turnId)) !== browserId)
+   896→          return reply.code(423).send({ error: handoffClosed });
+   897→        const result = await control(browserId, input);
+   898→        if (input.type === 'copy') copiedText = typeof result === 'string' ? result : undefined;
+   899→      }
+   900→      if ((await handoffBrowser(body.data.turnId)) !== browserId)
+   901→        return reply.code(423).send({ error: handoffClosed });
+   902→      return { ok: true, ...(copiedText === undefined ? {} : { copiedText }) };
+   903→    } catch (error) {
+   904→      const code = error instanceof BrowserActionError ? error.code : undefined;
+   905→      return reply.code(409).send({
+   906→        error:
+   907→          browserErrorMessage(code) ??
+   908→          'The browser did not finish that input. Check the page before trying again.',
+   909→      });
+   910→    }
+   911→  });
+   912→  app.post('/api/browser-handoff/done', async (request, reply) => {
+   913→    const body = z.object({ turnId: z.uuid() }).strict().safeParse(request.body);
+   914→    if (!body.success) return reply.code(400).send({ error: 'Choose a browser handoff.' });
+   915→    if (!(await resumeAfterHandoff(body.data.turnId)))
+   916→      return reply.code(423).send({ error: handoffClosed });
+   917→    return { ok: true };
+   918→  });
+   919→  app.post('/api/browser-handoff/navigate', async (request, reply) => {
+   920→    const body = z
+   921→      .object({ turnId: z.uuid(), action: z.enum(['back', 'reload']) })
+   922→      .strict()
+   923→      .safeParse(request.body);
+   924→    if (!body.success) return reply.code(400).send({ error: 'Choose back or reload.' });
+   925→    const act = dependencies.computer?.act;
+   926→    if (!act) return reply.code(404).send({ error: 'The browser is unavailable.' });
+   927→    const browserId = await handoffBrowser(body.data.turnId);
+   928→    if (!browserId) return reply.code(423).send({ error: handoffClosed });
+   929→    try {
+   930→      await act(browserId, { action: body.data.action });
+   931→    } catch (error) {
+   932→      const code = error instanceof BrowserActionError ? error.code : undefined;
+   933→      return reply
+   934→        .code(409)
+   935→        .send({ error: browserErrorMessage(code) ?? 'The page did not finish loading.' });
+   936→    }
+   937→    return { ok: true };
+   938→  });
+   939→  return app;
+   940→}
+   941→

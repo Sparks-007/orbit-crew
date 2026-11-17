@@ -1,0 +1,1694 @@
+     1→import { createHash, randomUUID } from 'node:crypto';
+     2→import type { Pool, PoolClient } from 'pg';
+     3→import type { FastifyInstance } from 'fastify';
+     4→import { z } from 'zod';
+     5→import type {
+     6→  ModelAccess,
+     7→  ModelBackend,
+     8→  ModelCredential,
+     9→  ModelDefinition,
+    10→} from '../ports/models.ts';
+    11→import { ModelAuthError, ModelWorkspaceSelectionError } from '../ports/models.ts';
+    12→import { ModelRequestError } from '../ports/agent.ts';
+    13→import type { CredentialKeyStore } from '../ports/key-store.ts';
+    14→import type {
+    15→  ModelLane,
+    16→  ModelMethod,
+    17→  ModelChoice,
+    18→  ModelProvider,
+    19→  ModelRoute,
+    20→  ModelRoutes,
+    21→  ModelIssue,
+    22→  ModelSelection,
+    23→  ModelsResponse,
+    24→  WorkKind,
+    25→  WorkModel,
+    26→} from '../shared/models.ts';
+    27→import {
+    28→  apiKeyConnectionProviders,
+    29→  boundedPrice,
+    30→  modelProviderInfo,
+    31→  modelProviderNames,
+    32→  azureDeploymentPattern,
+    33→  bedrockRegionPattern,
+    34→  cloudflareAccountPattern,
+    35→  cloudflareGatewayPattern,
+    36→  lightestEffort,
+    37→  modelSource,
+    38→  openAIRegions,
+    39→  routeModel,
+    40→} from '../shared/models.ts';
+    41→import { signInPage } from '../shared/sign-in-page.ts';
+    42→import { appPages } from '../shared/app-links.ts';
+    43→import { modelKeyError } from '../shared/model-keys.ts';
+    44→import {
+    45→  agentModels,
+    46→  defaultEffort,
+    47→  defaultModel,
+    48→  memoryModels,
+    49→} from '../shared/model-defaults.ts';
+    50→import { createDatabaseModelStore, type ModelRecord, type ModelState } from './model-store.ts';
+    51→import { analyticsModel, snapshotAnalytics, type CaptureAnalytics } from './analytics.ts';
+    52→import type { SettingActor } from './analytics-settings.ts';
+    53→import { logFailure } from './failure-log.ts';
+    54→import { modelFailureReason } from '../shared/model-quota.ts';
+    55→import { createTextRedactor, redactSecretText } from './redaction.ts';
+    56→import { afterCommit } from './transaction.ts';
+    57→
+    58→const keySchema = z
+    59→  .object({
+    60→    provider: z.enum(apiKeyConnectionProviders),
+    61→    key: z.string().trim().min(8).max(32000),
+    62→    region: z.string().trim().max(100).optional(),
+    63→    url: z.string().trim().max(2000).optional(),
+    64→    model: z.string().trim().max(200).optional(),
+    65→    deployment: z.string().trim().max(200).optional(),
+    66→    accountId: z.string().trim().max(100).optional(),
+    67→    gatewayId: z.string().trim().max(100).optional(),
+    68→    workspaceId: z.string().trim().max(100).optional(),
+    69→  })
+    70→  .strict();
+    71→export const modelSelectionInput = z
+    72→  .object({
+    73→    connectionId: z.uuid(),
+    74→    modelId: z.string().min(1).max(200),
+    75→    effort: z.enum(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']),
+    76→  })
+    77→  .strict();
+    78→class ConnectionError extends ModelRequestError {}
+    79→
+    80→function modelPricing(model: ModelDefinition): ModelChoice['pricing'] {
+    81→  if (model.choice.id === 'openrouter/auto') return 'variable';
+    82→  const cost = z
+    83→    .object({
+    84→      input: z.number().finite(),
+    85→      output: z.number().finite(),
+    86→      cacheRead: z.number().finite().optional(),
+    87→      cacheWrite: z.number().finite().optional(),
+    88→    })
+    89→    .safeParse(model.spec.cost).data;
+    90→  if (!cost) return undefined;
+    91→  if (Object.values(cost).some((value) => value < 0)) return 'variable';
+    92→  return {
+    93→    input: cost.input,
+    94→    output: cost.output,
+    95→    ...(cost.cacheRead !== undefined ? { cacheRead: cost.cacheRead } : {}),
+    96→    ...(cost.cacheWrite !== undefined ? { cacheWrite: cost.cacheWrite } : {}),
+    97→  };
+    98→}
+    99→
+   100→export const modelRouteInput = z.union([modelSelectionInput, z.literal('light'), z.null()]);
+   101→
+   102→export interface WorkOrigin {
+   103→  kind: WorkKind;
+   104→  task?: ModelSelection | null;
+   105→  schedule?: ModelSelection | null;
+   106→}
+   107→
+   108→const workNames = {
+   109→  task: 'This task',
+   110→  schedule: 'This schedule',
+   111→  lane: { schedule: 'Schedules', background: 'Work Nod starts on its own' },
+   112→} as const;
+   113→
+   114→export function endpointAddress(address: string) {
+   115→  let url: URL;
+   116→  try {
+   117→    url = new URL(
+   118→      /^[a-z][a-z\d+.-]*:/i.test(address) && !/^[^/:]+:\d+(\/|$)/.test(address)
+   119→        ? address
+   120→        : `http://${address}`,
+   121→    );
+   122→  } catch {
+   123→    return undefined;
+   124→  }
+   125→  if (
+   126→    !['http:', 'https:'].includes(url.protocol) ||
+   127→    url.username ||
+   128→    url.password ||
+   129→    /[?#]/.test(url.href)
+   130→  )
+   131→    return undefined;
+   132→  return url.href.replace(/\/+$/, '');
+   133→}
+   134→
+   135→function azureAddress(address: string) {
+   136→  const value = address.trim();
+   137→  const url = endpointAddress(/^[a-z][a-z\d+.-]*:\/\//i.test(value) ? value : `https://${value}`);
+   138→  if (!url) return undefined;
+   139→  const { protocol, hostname, origin, pathname } = new URL(url);
+   140→  if (protocol !== 'https:' && !['localhost', '127.0.0.1', '[::1]'].includes(hostname))
+   141→    return undefined;
+   142→  return pathname === '/' || pathname === '/openai' ? `${origin}/openai/v1` : url;
+   143→}
+   144→
+   145→export function modelKeyCredential(
+   146→  provider: ModelProvider,
+   147→  key: string,
+   148→  settings: {
+   149→    region?: string;
+   150→    url?: string;
+   151→    model?: string;
+   152→    deployment?: string;
+   153→    accountId?: string;
+   154→    gatewayId?: string;
+   155→    workspaceId?: string;
+   156→  },
+   157→): ModelCredential {
+   158→  if (provider === 'openai') {
+   159→    const region = settings.region || 'global';
+   160→    if (!Object.hasOwn(openAIRegions, region))
+   161→      throw new ConnectionError('Choose an OpenAI API region.');
+   162→    return {
+   163→      type: 'api_key',
+   164→      key,
+   165→      ...(region !== 'global' ? { region: region as keyof typeof openAIRegions } : {}),
+   166→    };
+   167→  }
+   168→  if (provider === 'anthropic') {
+   169→    const workspaceId = settings.workspaceId?.trim();
+   170→    if (workspaceId && (workspaceId.length > 100 || !/^[\x21-\x7e]+$/.test(workspaceId)))
+   171→      throw new ConnectionError('Enter a Workspace ID from the Claude Console.');
+   172→    return { type: 'api_key', key, ...(workspaceId ? { workspaceId } : {}) };
+   173→  }
+   174→  if (provider === 'amazon-bedrock') {
+   175→    if (!settings.region || !bedrockRegionPattern.test(settings.region))
+   176→      throw new ConnectionError('Enter an AWS Region, such as us-east-1.');
+   177→    return { type: 'bedrock', key, region: settings.region };
+   178→  }
+   179→  if (provider === 'cloudflare-workers-ai' || provider === 'cloudflare-ai-gateway') {
+   180→    if (!settings.accountId || !cloudflareAccountPattern.test(settings.accountId))
+   181→      throw new ConnectionError('Enter your 32-character Cloudflare account ID.');
+   182→    if (
+   183→      provider === 'cloudflare-ai-gateway' &&
+   184→      (!settings.gatewayId || !cloudflareGatewayPattern.test(settings.gatewayId))
+   185→    )
+   186→      throw new ConnectionError('Enter your Cloudflare AI Gateway ID.');
+   187→    return {
+   188→      type: 'cloudflare',
+   189→      key,
+   190→      accountId: settings.accountId.toLowerCase(),
+   191→      ...(provider === 'cloudflare-ai-gateway' ? { gatewayId: settings.gatewayId } : {}),
+   192→    };
+   193→  }
+   194→  if (provider !== 'azure') return { type: 'api_key', key };
+   195→  const url = settings.url && azureAddress(settings.url);
+   196→  if (!url)
+   197→    throw new ConnectionError(
+   198→      'Enter your Azure OpenAI endpoint, such as https://your-resource.openai.azure.com.',
+   199→    );
+   200→  const deployment = settings.deployment || settings.model;
+   201→  if (!settings.model || !deployment || !azureDeploymentPattern.test(deployment))
+   202→    throw new ConnectionError('Choose the model and enter its deployment name.');
+   203→  return { type: 'azure', url, key, model: settings.model, deployment };
+   204→}
+   205→
+   206→function sameAccount(
+   207→  row: ModelRecord,
+   208→  provider: ModelProvider,
+   209→  method: ModelMethod,
+   210→  value: ModelCredential,
+   211→) {
+   212→  if (row.managed || row.provider !== provider || row.method !== method) return false;
+   213→  const saved = row.credential;
+   214→  if (value.type === 'oauth') return saved?.type === 'oauth' && saved.accountId === value.accountId;
+   215→  if (value.type === 'endpoint') return saved?.type === 'endpoint' && saved.url === value.url;
+   216→  return JSON.stringify(saved) === JSON.stringify(value);
+   217→}
+   218→
+   219→function connectionLabel(provider: ModelProvider, method: ModelMethod, value: ModelCredential) {
+   220→  if (provider === 'openai' && value.type === 'api_key' && value.region)
+   221→    return `OpenAI · ${openAIRegions[value.region]}`;
+   222→  if (provider === 'anthropic' && value.type === 'api_key' && value.workspaceId)
+   223→    return value.workspaceId;
+   224→  if (value.type === 'oauth') return value.email ?? 'ChatGPT account';
+   225→  if (value.type === 'endpoint') return new URL(value.url).host;
+   226→  if (value.type === 'bedrock') return value.region;
+   227→  if (value.type === 'azure') return value.deployment;
+   228→  if (value.type === 'cloudflare') return value.gatewayId ?? value.accountId;
+   229→  return modelSource({ provider, method });
+   230→}
+   231→
+   232→function textCompanion(row: Pick<ModelRecord, 'provider' | 'method' | 'models'>) {
+   233→  const candidates = row.models.filter(
+   234→    (model) =>
+   235→      !model.choice.audio &&
+   236→      model.choice.efforts.length > 0 &&
+   237→      Array.isArray(model.spec.input) &&
+   238→      model.spec.input.includes('text'),
+   239→  );
+   240→  const choice = defaultModel(
+   241→    row.provider,
+   242→    candidates.map((model) => model.choice),
+   243→    row.method,
+   244→  );
+   245→  return candidates.find((model) => model.choice.id === choice?.id);
+   246→}
+   247→
+   248→function missingTextCompanion() {
+   249→  return new ConnectionError(
+   250→    `This audio model needs a text model on the same connection. Refresh its models or choose another model in ${appPages['/settings/models']}.`,
+   251→  );
+   252→}
+   253→
+   254→function usable(
+   255→  connections: Pick<ModelRecord, 'id' | 'provider' | 'method' | 'status' | 'models'>[],
+   256→  selection: ModelSelection | null,
+   257→) {
+   258→  return (
+   259→    !!selection &&
+   260→    connections.some(
+   261→      (row) =>
+   262→        row.id === selection.connectionId &&
+   263→        row.status === 'connected' &&
+   264→        row.models.some(
+   265→          (model) =>
+   266→            model.choice.id === selection.modelId &&
+   267→            model.choice.efforts.includes(selection.effort) &&
+   268→            (!model.choice.audio || Boolean(textCompanion(row))),
+   269→        ),
+   270→    )
+   271→  );
+   272→}
+   273→
+   274→function selectedConnectionWorks(state: ModelState) {
+   275→  return state.connections.some(
+   276→    (row) => row.id === state.selection?.connectionId && row.status === 'connected',
+   277→  );
+   278→}
+   279→
+   280→function attention(row: Pick<ModelRecord, 'provider' | 'method' | 'managed' | 'status'>) {
+   281→  const name = `the ${modelSource(row)} connection`;
+   282→  return new ConnectionError(
+   283→    row.status === 'loading'
+   284→      ? `Load the models for ${name} in ${appPages['/settings/models']}.`
+   285→      : row.managed
+   286→        ? `Refresh ${name} in ${appPages['/settings/models']}.`
+   287→        : row.method === 'api_key'
+   288→          ? `Remove ${name} and add it again in ${appPages['/settings/models']}.`
+   289→          : `Reconnect ${name} in ${appPages['/settings/models']}.`,
+   290→  );
+   291→}
+   292→
+   293→const credentialTag = (value: ModelCredential | undefined) =>
+   294→  value &&
+   295→  createHash('sha256')
+   296→    .update(JSON.stringify(value.type === 'oauth' ? [value.accountId, value.clientId] : value))
+   297→    .digest('hex');
+   298→const failureWindow = (failures: number) =>
+   299→  Math.min(120_000 * 3 ** Math.max(0, failures - 1), 6 * 3_600_000);
+   300→function failures(row: Pick<ModelRecord, 'requestFailures'> | undefined, tag: string | undefined) {
+   301→  return Object.entries(row?.requestFailures ?? {}).filter(
+   302→    ([, failure]) => tag && failure.credentialTag === tag,
+   303→  );
+   304→}
+   305→
+   306→export function createModelService(options: {
+   307→  database: Pool;
+   308→  ownerId: string;
+   309→  keyStore: CredentialKeyStore;
+   310→  backend: ModelBackend;
+   311→  origin: string;
+   312→  bootstrap?: {
+   313→    provider: ModelProvider;
+   314→    model?: string;
+   315→    credentials: Partial<Record<ModelProvider, ModelCredential>>;
+   316→  };
+   317→  changed?(): void;
+   318→}) {
+   319→  const { backend } = options;
+   320→  const store = createDatabaseModelStore({
+   321→    database: options.database,
+   322→    ownerId: options.ownerId,
+   323→    keyStore: options.keyStore,
+   324→  });
+   325→  let analytics: CaptureAnalytics | undefined;
+   326→  let requestBudget: ModelAccess['reserve'];
+   327→  const reserve: NonNullable<ModelAccess['reserve']> = async (maximumUsd) => {
+   328→    if (!requestBudget) throw new Error('The model request budget is not configured.');
+   329→    return requestBudget(maximumUsd);
+   330→  };
+   331→  function connectionChanged(
+   332→    provider: ModelProvider,
+   333→    method: ModelMethod,
+   334→    status: 'connected' | 'disconnected' | 'failed',
+   335→    capture = analytics,
+   336→  ) {
+   337→    if (provider === 'elevenlabs') return;
+   338→    capture?.({
+   339→      event: 'model_connection_changed',
+   340→      properties: { provider, method, status },
+   341→    });
+   342→  }
+   343→  async function tracked<T>(provider: ModelProvider, method: ModelMethod, save: () => Promise<T>) {
+   344→    try {
+   345→      const result = await save();
+   346→      connectionChanged(provider, method, 'connected');
+   347→      return result;
+   348→    } catch (error) {
+   349→      connectionChanged(provider, method, 'failed');
+   350→      throw error;
+   351→    }
+   352→  }
+   353→  let rows: (ModelRecord & {
+   354→    keyEnding?: string;
+   355→    issue?: ModelIssue;
+   356→    issues?: Record<string, ModelIssue>;
+   357→    retry?: Record<string, number>;
+   358→  })[] = [];
+   359→  let selectionCheck: (() => Promise<unknown>) | undefined;
+   360→  let checked: string | undefined;
+   361→  let pendingCheck: Promise<unknown> | undefined;
+   362→  let initialized = false;
+   363→  let selection: ModelSelection | null = null;
+   364→  let routes: ModelRoutes = {};
+   365→  let starting: Promise<unknown> = Promise.resolve();
+   366→  const pendingControllers = new Set<AbortController>();
+   367→  let closed = false;
+   368→  const secrets = new Set<string>();
+   369→  const observers = new Set<(values: string[]) => void>();
+   370→  const attempts = new Map<
+   371→    string,
+   372→    {
+   373→      provider: 'openai' | 'openrouter';
+   374→      state: string;
+   375→      controller: AbortController;
+   376→      complete?(callback: URL): void;
+   377→      connectionId?: string;
+   378→      secret: Record<string, unknown>;
+   379→      expires: number;
+   380→      timer: ReturnType<typeof setTimeout>;
+   381→      status: 'waiting' | 'completing' | 'connected' | 'failed';
+   382→      error?: string;
+   383→      completion?: Promise<void>;
+   384→      cancelled?: { reason: string; phase: string };
+   385→    }
+   386→  >();
+   387→  function signInFailure(attempt: NonNullable<ReturnType<typeof attempts.get>>, error: unknown) {
+   388→    return {
+   389→      provider: attempt.provider,
+   390→      reason: attempt.cancelled?.reason ?? Object(error).reason,
+   391→      phase: attempt.cancelled?.phase ?? attempt.status,
+   392→      elapsedMs: Date.now() - (attempt.expires - 600000),
+   393→    };
+   394→  }
+   395→  async function cancel(state: string, reason = 'cancelled') {
+   396→    const attempt = attempts.get(state);
+   397→    if (!attempt) return;
+   398→    clearTimeout(attempt.timer);
+   399→    if (attempt.status === 'waiting' || attempt.status === 'completing') {
+   400→      attempt.cancelled ??= { reason, phase: attempt.status };
+   401→      if (!attempt.completion)
+   402→        logFailure('model_sign_in_failed', undefined, signInFailure(attempt, undefined));
+   403→    }
+   404→    attempt.status = 'failed';
+   405→    attempt.controller.abort();
+   406→    await attempt.completion?.catch(() => {});
+   407→    if (attempts.get(state) === attempt) attempts.delete(state);
+   408→  }
+   409→  function active(attempt: NonNullable<ReturnType<typeof attempts.get>>) {
+   410→    if (
+   411→      closed ||
+   412→      attempt.controller.signal.aborted ||
+   413→      attempt.expires < Date.now() ||
+   414→      attempts.get(attempt.state) !== attempt
+   415→    )
+   416→      throw new ConnectionError('This sign-in request has expired. Start a new connection.');
+   417→  }
+   418→  function remember(value: ModelCredential) {
+   419→    const values = (
+   420→      value.type === 'oauth'
+   421→        ? [value.access, value.refresh, value.idToken]
+   422→        : value.key
+   423→          ? [value.key]
+   424→          : []
+   425→    ).filter((secret) => typeof secret === 'string' && secret.length > 0 && !secrets.has(secret));
+   426→    for (const secret of values) secrets.add(secret);
+   427→    if (values.length) for (const observer of observers) observer(values);
+   428→  }
+   429→  async function reload() {
+   430→    const state = await store.read();
+   431→    rows = state.connections.map(({ credential: saved, ...row }) => {
+   432→      const value = row.managed ? options.bootstrap?.credentials[row.provider] : saved;
+   433→      const failed = failures(row, credentialTag(value)).sort(
+   434→        ([, a], [, b]) => b.retryAt - a.retryAt,
+   435→      );
+   436→      return {
+   437→        ...row,
+   438→        ...(value &&
+   439→        typeof value === 'object' &&
+   440→        'key' in value &&
+   441→        typeof value.key === 'string' &&
+   442→        value.key.length > 4
+   443→          ? { keyEnding: value.key.slice(-4) }
+   444→          : {}),
+   445→        ...(failed.length
+   446→          ? {
+   447→              issue: { reason: failed[0]![1].reason },
+   448→              issues: Object.fromEntries(failed.map(([id, item]) => [id, { reason: item.reason }])),
+   449→              retry: Object.fromEntries(failed.map(([id, item]) => [id, item.retryAt])),
+   450→            }
+   451→          : {}),
+   452→      };
+   453→    });
+   454→    selection = state.selection;
+   455→    routes = state.routes;
+   456→    checkSelection(state);
+   457→    options.changed?.();
+   458→  }
+   459→  function checkSelection(state: ModelState) {
+   460→    const row = state.connections.find((item) => item.id === state.selection?.connectionId);
+   461→    if (!selectionCheck || !row || row.status !== 'connected' || closed) return;
+   462→    const key = `${row.id}:${state.selection!.modelId}:${credentialTag(credential(row))}`;
+   463→    if (key === checked) return;
+   464→    checked = key;
+   465→    const saved = credential(row);
+   466→    const port = saved?.type === 'endpoint' ? new URL(saved.url).port : undefined;
+   467→    pendingCheck = selectionCheck().catch((error: unknown) =>
+   468→      logFailure('model_check_failed', error, {
+   469→        provider: row.provider,
+   470→        ...(port === undefined
+   471→          ? {}
+   472→          : { serverKind: port === '11434' ? 'ollama' : port === '1234' ? 'lmstudio' : 'other' }),
+   473→        status: Object(error).providerStatus,
+   474→      }),
+   475→    );
+   476→  }
+   477→  function requested(row: ModelRecord | undefined, modelId: string | undefined) {
+   478→    const chosen = row?.models.find((model) => model.choice.id === modelId);
+   479→    if (!row || !chosen) return [];
+   480→    const companion = chosen.choice.audio ? textCompanion(row)?.choice.id : undefined;
+   481→    return companion ? [chosen.choice.id, companion] : [chosen.choice.id];
+   482→  }
+   483→  function credential(row: ModelRecord | undefined) {
+   484→    if (!row) return undefined;
+   485→    const value = row.managed ? options.bootstrap?.credentials[row.provider] : row.credential;
+   486→    if (value) remember(value);
+   487→    return value;
+   488→  }
+   489→  function requestAccess(
+   490→    row: ModelRecord,
+   491→  ): Pick<ModelAccess, 'read' | 'prepareRequest' | 'reserve'> {
+   492→    return {
+   493→      read: () => read(row.id),
+   494→      reserve,
+   495→      async prepareRequest(modelId, automatic) {
+   496→        const tag = credentialTag(await read(row.id));
+   497→        const failure = new Map(
+   498→          failures(
+   499→            rows.find((item) => item.id === row.id),
+   500→            tag,
+   501→          ),
+   502→        ).get(modelId);
+   503→        if (automatic && failure && Date.now() < failure.retryAt)
+   504→          throw new ConnectionError(
+   505→            `${modelProviderNames[row.provider]} failed the last request to ${modelId} (${failure.reason}). Automatic requests to this model are paused until a request succeeds. Check this connection in ${appPages['/settings/models']} or ask again to make a new request.`,
+   506→          );
+   507→        return async (error) => {
+   508→          if (!tag || closed) return;
+   509→          const recorded = failures(
+   510→            rows.find((item) => item.id === row.id),
+   511→            tag,
+   512→          );
+   513→          if (!error && !recorded.some(([id]) => id === modelId)) return;
+   514→          try {
+   515→            await store.change((state) => {
+   516→              const saved = state.connections.find((item) => item.id === row.id);
+   517→              if (!saved || credentialTag(credential(saved)) !== tag) return;
+   518→              const current = new Map(failures(saved, tag));
+   519→              if (!error) {
+   520→                if (current.delete(modelId))
+   521→                  for (const item of current.values())
+   522→                    item.retryAt = Math.min(item.retryAt, Date.now());
+   523→                saved.requestFailures = Object.fromEntries(current);
+   524→                return;
+   525→              }
+   526→              const previous = current.get(modelId);
+   527→              const count =
+   528→                previous && Date.now() < previous.retryAt
+   529→                  ? previous.failures
+   530→                  : (previous?.failures ?? 0) + 1;
+   531→              saved.requestFailures = Object.fromEntries(current);
+   532→              saved.requestFailures[modelId] = {
+   533→                credentialTag: tag,
+   534→                failures: count,
+   535→                retryAt: Date.now() + failureWindow(count),
+   536→                reason: redactSecretText(modelFailureReason(error))
+   537→                  .replace(/\s*\[request phase: [^\]]*\]\s*$/, '')
+   538→                  .replace(/\s+/g, ' ')
+   539→                  .trim()
+   540→                  .slice(0, 300),
+   541→              };
+   542→            });
+   543→            await reload();
+   544→          } catch (error) {
+   545→            logFailure('model_failure_save_failed', error);
+   546→          }
+   547→        };
+   548→      },
+   549→    };
+   550→  }
+   551→  function apiKeyConnection(provider: ModelProvider) {
+   552→    const candidates = rows.filter(
+   553→      (row) =>
+   554→        row.provider === provider &&
+   555→        (row.method === 'api_key' || (provider === 'openrouter' && row.method === 'oauth')) &&
+   556→        row.status === 'connected',
+   557→    );
+   558→    return (
+   559→      candidates.find((row) => row.id === selection?.connectionId) ??
+   560→      (candidates.length === 1 ? candidates[0] : undefined)
+   561→    );
+   562→  }
+   563→  function imageModel() {
+   564→    const connected = rows.filter((row) => row.status === 'connected');
+   565→    const selected = connected.find((row) => row.id === selection?.connectionId);
+   566→    for (const row of [
+   567→      ...(selected ? [selected] : []),
+   568→      ...connected.filter((row) => row !== selected),
+   569→    ]) {
+   570→      const models = row.models.filter((model) => model.choice.images);
+   571→      const definition =
+   572→        (row === selected && models.find((model) => model.choice.id === selection?.modelId)) ||
+   573→        models.find((model) => model.choice.id === memoryModels[row.provider]) ||
+   574→        models.find((model) => model.choice.id === agentModels[row.provider]) ||
+   575→        models[0];
+   576→      if (definition) return { row, definition };
+   577→    }
+   578→  }
+   579→  function classificationModel(otherConnections = false) {
+   580→    const selected = selection && { ...selection };
+   581→    const current = rows.find((row) => row.id === selected?.connectionId);
+   582→    const main = current?.models.find((model) => model.choice.id === selected?.modelId);
+   583→    const price = main && modelPricing(main);
+   584→    if (
+   585→      current?.provider === 'openrouter' &&
+   586→      price &&
+   587→      price !== 'variable' &&
+   588→      price.input + price.output === 0
+   589→    )
+   590→      return undefined;
+   591→    const candidates = [
+   592→      current,
+   593→      ...(otherConnections ? rows.filter((row) => row !== current) : []),
+   594→    ];
+   595→    for (const row of candidates) {
+   596→      if (!row || row.status !== 'connected') continue;
+   597→      const definition = row.models.find(
+   598→        (model) => model.choice.id === memoryModels[row.provider] && !model.choice.audio,
+   599→      );
+   600→      if (!definition) continue;
+   601→      if (otherConnections) {
+   602→        if (row === current) return { row, definition };
+   603→        const peers = candidates.filter(
+   604→          (candidate) =>
+   605→            candidate?.status === 'connected' &&
+   606→            candidate.provider === row.provider &&
+   607→            candidate.models.some(
+   608→              (model) =>
+   609→                model.choice.id === memoryModels[candidate.provider] && !model.choice.audio,
+   610→            ),
+   611→        );
+   612→        if (peers.length === 1) return { row, definition };
+   613→        continue;
+   614→      }
+   615→      const main = row.models.find((model) => model.choice.id === selected?.modelId);
+   616→      if (!main) continue;
+   617→      const price = modelPricing(definition);
+   618→      const mainPrice = modelPricing(main);
+   619→      if (
+   620→        !price ||
+   621→        price === 'variable' ||
+   622→        price.input + price.output <= 0 ||
+   623→        !mainPrice ||
+   624→        mainPrice === 'variable' ||
+   625→        mainPrice.input + mainPrice.output <= 0 ||
+   626→        price.input > mainPrice.input ||
+   627→        price.output > mainPrice.output
+   628→      )
+   629→        continue;
+   630→      return { row, definition };
+   631→    }
+   632→  }
+   633→  async function settle(client: PoolClient | undefined, apply: () => void) {
+   634→    if (!client) return reload();
+   635→    afterCommit(client, () => {
+   636→      apply();
+   637→      options.changed?.();
+   638→      void reload().catch((error: unknown) => logFailure('model_settings_reload_failed', error));
+   639→    });
+   640→  }
+   641→  function chosen(auxiliary: boolean, choice: ModelSelection | null) {
+   642→    const selected = auxiliary ? selection && { ...selection } : choice && { ...choice };
+   643→    const row = rows.find((row) => row.id === selected?.connectionId);
+   644→    if (!row || !selected)
+   645→      throw new ConnectionError(
+   646→        `Open ${appPages['/settings/models']}. Connect a service and choose a model.`,
+   647→      );
+   648→    if (row.status !== 'connected') throw attention(row);
+   649→    const definition =
+   650→      (auxiliary
+   651→        ? row.models.find((model) => model.choice.id === memoryModels[row.provider])
+   652→        : undefined) ?? row.models.find((model) => model.choice.id === selected.modelId);
+   653→    if (!definition || (!definition.choice.efforts.includes(selected.effort) && !auxiliary))
+   654→      throw new ConnectionError(
+   655→        `The selected model is unavailable on this connection (${row.provider} / ${selected.modelId}). Reload its models or choose another model in ${appPages['/settings/models']}.`,
+   656→      );
+   657→    const companion = definition.choice.audio ? textCompanion(row) : undefined;
+   658→    if (definition.choice.audio && !companion) throw missingTextCompanion();
+   659→    return { selected, row, definition, companion };
+   660→  }
+   661→  function unpricedPreparationModel() {
+   662→    try {
+   663→      const background = service.workModel({ kind: 'background' }).selection;
+   664→      for (const auxiliary of [false, true]) {
+   665→        const { definition, companion } = chosen(auxiliary, background);
+   666→        const target = companion ?? definition;
+   667→        if (!boundedPrice(modelPricing(target))) return target.choice.name;
+   668→      }
+   669→    } catch {
+   670→      return;
+   671→    }
+   672→  }
+   673→  function lightModel(): ModelSelection | null {
+   674→    const candidate = classificationModel();
+   675→    if (!candidate) return null;
+   676→    const { row, definition } = candidate;
+   677→    if (row.id === selection?.connectionId && definition.choice.id === selection.modelId)
+   678→      return null;
+   679→    return {
+   680→      connectionId: row.id,
+   681→      modelId: definition.choice.id,
+   682→      effort: defaultEffort(row.provider, definition.choice),
+   683→    };
+   684→  }
+   685→  function textChoice(
+   686→    connections: ModelRecord[],
+   687→    value: ModelSelection,
+   688→  ): { row: ModelRecord; definition: ModelDefinition } {
+   689→    const row = connections.find((item) => item.id === value.connectionId);
+   690→    const definition =
+   691→      row?.status === 'connected' &&
+   692→      row.models.find((item) => item.choice.id === value.modelId && !item.choice.audio);
+   693→    if (!row || !definition || !definition.choice.efforts.includes(value.effort))
+   694→      throw Object.assign(new ConnectionError('Choose an available text model and effort.'), {
+   695→        statusCode: 400,
+   696→      });
+   697→    return { row, definition };
+   698→  }
+   699→  function routeState(value: ModelRoute | null | undefined) {
+   700→    return value === 'light' ? 'light' : value ? 'configured' : 'default';
+   701→  }
+   702→  function unavailable(work: WorkModel, kind: WorkKind, row: ModelRecord | undefined) {
+   703→    const name =
+   704→      work.follows === 'task' || work.follows === 'schedule'
+   705→        ? workNames[work.follows]
+   706→        : kind === 'chat'
+   707→          ? 'This work'
+   708→          : workNames.lane[kind];
+   709→    const place =
+   710→      work.follows === 'task' || work.follows === 'schedule'
+   711→        ? 'choose another model for it in Scheduled'
+   712→        : `choose another model in ${appPages['/settings/models']}`;
+   713→    if (row && row.status !== 'connected') {
+   714→      const reason = attention(row).message;
+   715→      return new ConnectionError(
+   716→        `${name} uses a model on a connection that needs attention. ${reason}`,
+   717→      );
+   718→    }
+   719→    return new ConnectionError(
+   720→      `${name} uses ${row ? `${row.provider} / ` : ''}${work.selection.modelId}, which is no longer available. Reload its models or ${place}.`,
+   721→    );
+   722→  }
+   723→  async function read(id: string) {
+   724→    const result = await store.change(async (state) => {
+   725→      const row = state.connections.find((item) => item.id === id);
+   726→      if (!row) return {};
+   727→      if (row.status === 'reconnect') throw attention(row);
+   728→      try {
+   729→        const current = credential(row);
+   730→        if (current?.type !== 'oauth' || current.expires > Date.now() + 300000)
+   731→          return { value: current };
+   732→        const next = await backend.refresh(current);
+   733→        remember(next);
+   734→        row.credential = next;
+   735→        return { value: next };
+   736→      } catch (error) {
+   737→        logFailure('model_refresh_failed', error instanceof Error ? (error.cause ?? error) : error);
+   738→        if (!(error instanceof ModelAuthError) || !error.requiresReconnect)
+   739→          throw new ConnectionError(
+   740→            error instanceof ModelAuthError
+   741→              ? error.message
+   742→              : 'The model service is temporarily unavailable. Try again.',
+   743→          );
+   744→        row.status = 'reconnect';
+   745→        return { reconnect: row };
+   746→      }
+   747→    });
+   748→    if (result.reconnect) {
+   749→      await reload();
+   750→      throw attention(result.reconnect);
+   751→    }
+   752→    return result.value;
+   753→  }
+   754→  async function needsReconnect(
+   755→    id: string,
+   756→    seen: { models: ModelDefinition[]; credential?: ModelCredential },
+   757→  ) {
+   758→    try {
+   759→      const flagged = await store.change((state) => {
+   760→        const row = state.connections.find((item) => item.id === id);
+   761→        if (
+   762→          !row ||
+   763→          row.managed ||
+   764→          row.status !== 'connected' ||
+   765→          JSON.stringify(row.models) !== JSON.stringify(seen.models) ||
+   766→          (seen.credential && JSON.stringify(row.credential) !== JSON.stringify(seen.credential))
+   767→        )
+   768→          return false;
+   769→        row.status = 'reconnect';
+   770→        return true;
+   771→      });
+   772→      if (flagged) await reload();
+   773→    } catch (error) {
+   774→      logFailure('model_reconnect_flag_failed', error);
+   775→    }
+   776→  }
+   777→  async function catalog(
+   778→    provider: ModelProvider,
+   779→    method: ModelMethod,
+   780→    value?: ModelCredential,
+   781→    rejected?: () => Promise<void>,
+   782→  ) {
+   783→    if (value) remember(value);
+   784→    try {
+   785→      return await backend.catalog(provider, method, value);
+   786→    } catch (error) {
+   787→      if (error instanceof ModelAuthError && error.requiresReconnect) await rejected?.();
+   788→      throw new ConnectionError(
+   789→        createTextRedactor([...secrets])(
+   790→          error instanceof Error ? error.message : String(error),
+   791→        ).slice(0, 2000),
+   792→      );
+   793→    }
+   794→  }
+   795→  async function checkStorage() {
+   796→    if (!options.keyStore.configured)
+   797→      throw new ConnectionError(
+   798→        'Configure NOD_VAULT_KEY in server settings before saving a connection.',
+   799→      );
+   800→    try {
+   801→      await options.keyStore.getKey();
+   802→    } catch (cause) {
+   803→      throw new ConnectionError(
+   804→        'Nod cannot open its credential storage. Check your server settings, then try again.',
+   805→        { cause },
+   806→      );
+   807→    }
+   808→  }
+   809→  async function save(
+   810→    provider: ModelProvider,
+   811→    method: ModelMethod,
+   812→    value: ModelCredential,
+   813→    definitions: ModelDefinition[],
+   814→    id?: string,
+   815→    {
+   816→      managed = false,
+   817→      replace = false,
+   818→      status = 'connected',
+   819→      signal,
+   820→    }: {
+   821→      managed?: boolean;
+   822→      replace?: boolean;
+   823→      status?: ModelRecord['status'];
+   824→      signal?: AbortSignal;
+   825→    } = {},
+   826→  ) {
+   827→    remember(value);
+   828→    if (!managed && !options.keyStore.configured)
+   829→      throw new ConnectionError(
+   830→        'Configure NOD_VAULT_KEY in server settings before saving a connection.',
+   831→      );
+   832→    if (status === 'connected' && !definitions.length && !modelProviderInfo[provider].speechOnly)
+   833→      throw new ConnectionError('This connection has no supported models.');
+   834→    const saved = await store.change((state) => {
+   835→      const previous = state.connections.find((row) =>
+   836→        id ? row.id === id : !managed && sameAccount(row, provider, method, value),
+   837→      );
+   838→      if (replace && !previous)
+   839→        throw new ConnectionError('This model connection was removed. Start a new connection.');
+   840→      const duplicates = managed
+   841→        ? []
+   842→        : state.connections.filter(
+   843→            (row) => row !== previous && sameAccount(row, provider, method, value),
+   844→          );
+   845→      if (!previous && state.connections.length - duplicates.length >= 80)
+   846→        throw new ConnectionError('Remove an unused model connection before adding another.');
+   847→      const working = status === 'loading' && previous?.status === 'connected';
+   848→      const row: ModelRecord = {
+   849→        id: previous?.id ?? id ?? randomUUID(),
+   850→        provider,
+   851→        method,
+   852→        label: connectionLabel(provider, method, value),
+   853→        models: working ? previous.models : definitions,
+   854→        managed,
+   855→        status: working ? 'connected' : status,
+   856→        requestFailures: previous?.requestFailures,
+   857→        ...(!managed ? { credential: value } : {}),
+   858→      };
+   859→      state.connections = state.connections.flatMap((item) =>
+   860→        item === previous ? [row] : duplicates.includes(item) ? [] : [item],
+   861→      );
+   862→      if (!previous) state.connections.push(row);
+   863→      if (state.selection && duplicates.some((item) => item.id === state.selection!.connectionId))
+   864→        state.selection = { ...state.selection, connectionId: row.id };
+   865→      selectDefault(state, row);
+   866→      return row.id;
+   867→    }, signal);
+   868→    await reload();
+   869→    return saved;
+   870→  }
+   871→  function selectDefault(state: ModelState, row: ModelRecord) {
+   872→    const { provider, method, models: definitions, id, managed, status } = row;
+   873→    const choices = definitions.map((model) => model.choice);
+   874→    const selected = state.selection;
+   875→    const choice = choices.find((model) => model.id === selected?.modelId);
+   876→    if (
+   877→      selected?.connectionId === id &&
+   878→      choice?.efforts.length &&
+   879→      !choice.efforts.includes(selected.effort)
+   880→    )
+   881→      selected.effort = lightestEffort(choice.efforts);
+   882→    for (const route of Object.values(state.routes)) {
+   883→      if (!route || route === 'light' || route.connectionId !== id) continue;
+   884→      const routed = choices.find((model) => model.id === route.modelId);
+   885→      if (routed?.efforts.length && !routed.efforts.includes(route.effort))
+   886→        route.effort = lightestEffort(routed.efforts);
+   887→    }
+   888→    const configuredModel =
+   889→      managed && options.bootstrap?.provider === provider ? options.bootstrap.model : undefined;
+   890→    const preferred = configuredModel
+   891→      ? choices.find((model) => model.id === configuredModel)
+   892→      : defaultModel(provider, choices, method);
+   893→    if (
+   894→      preferred &&
+   895→      status === 'connected' &&
+   896→      (!managed || options.bootstrap?.provider === provider) &&
+   897→      (!state.selectionSet || (!managed && !selectedConnectionWorks(state)))
+   898→    ) {
+   899→      state.selection = {
+   900→        connectionId: id,
+   901→        modelId: preferred.id,
+   902→        effort: defaultEffort(provider, preferred),
+   903→      };
+   904→      state.selectionSet = true;
+   905→    }
+   906→  }
+   907→  async function updateCatalog(id: string, signal?: AbortSignal) {
+   908→    signal?.throwIfAborted();
+   909→    const snapshot = (await store.read()).connections.find((item) => item.id === id);
+   910→    if (!snapshot) throw new ConnectionError('This model connection is unavailable.');
+   911→    if (!snapshot.managed && snapshot.status === 'reconnect') throw attention(snapshot);
+   912→    const value = credential(snapshot);
+   913→    if (!value) throw new ConnectionError('This model connection is unavailable.');
+   914→    const previous = JSON.stringify(snapshot);
+   915→    const definitions = await catalog(snapshot.provider, snapshot.method, value, () =>
+   916→      needsReconnect(id, snapshot),
+   917→    );
+   918→    if (!definitions.length && !modelProviderInfo[snapshot.provider].speechOnly)
+   919→      throw new ConnectionError('This connection has no supported models.');
+   920→    await store.change((state) => {
+   921→      const row = state.connections.find((item) => item.id === id);
+   922→      if (!row || JSON.stringify(row) !== previous)
+   923→        throw new ConnectionError('This model connection changed. Refresh its models again.');
+   924→      signal?.throwIfAborted();
+   925→      row.models = definitions;
+   926→      row.status = 'connected';
+   927→      row.label = connectionLabel(row.provider, row.method, value);
+   928→      selectDefault(state, row);
+   929→    }, signal);
+   930→    await reload();
+   931→  }
+   932→  async function refreshCatalog(id: string) {
+   933→    const row = rows.find((row) => row.id === id);
+   934→    if (!row) throw new ConnectionError('This model connection is unavailable.');
+   935→    if (!row.managed) await read(id);
+   936→    await updateCatalog(id);
+   937→  }
+   938→  function signInStatus(state: string) {
+   939→    const attempt = attempts.get(state);
+   940→    if (!attempt || closed || attempt.expires < Date.now())
+   941→      return { status: 'failed' as const, error: 'Sign-in expired. Start a new connection.' };
+   942→    return {
+   943→      status: attempt.status === 'completing' ? 'waiting' : attempt.status,
+   944→      ...(attempt.error ? { error: attempt.error } : {}),
+   945→    };
+   946→  }
+   947→  async function complete(callback: URL) {
+   948→    const state = callback.searchParams.get('state') ?? '';
+   949→    const attempt = attempts.get(state);
+   950→    if (!attempt || attempt.status !== 'waiting')
+   951→      throw new ConnectionError('This sign-in request has expired. Start a new connection.');
+   952→    active(attempt);
+   953→    attempt.status = 'completing';
+   954→    if (attempt.provider === 'openai') {
+   955→      try {
+   956→        attempt.complete!(callback);
+   957→      } catch (error) {
+   958→        await cancel(state, Object(Object(error).cause).reason ?? 'callback_rejected');
+   959→        throw error;
+   960→      }
+   961→    } else {
+   962→      attempt.completion = finish(
+   963→        attempt,
+   964→        backend.exchange('openrouter', attempt.secret, callback),
+   965→      );
+   966→      attempt.completion.catch(() => {});
+   967→    }
+   968→    return attempt.completion;
+   969→  }
+   970→  async function finish(
+   971→    attempt: NonNullable<ReturnType<typeof attempts.get>>,
+   972→    result: Promise<ModelCredential>,
+   973→  ) {
+   974→    const method = attempt.provider === 'openai' ? 'subscription' : 'oauth';
+   975→    try {
+   976→      const value = await result;
+   977→      active(attempt);
+   978→      attempt.status = 'completing';
+   979→      const id = await save(attempt.provider, method, value, [], attempt.connectionId, {
+   980→        replace: !!attempt.connectionId,
+   981→        status: 'loading',
+   982→        signal: attempt.controller.signal,
+   983→      });
+   984→      attempt.connectionId = id;
+   985→      active(attempt);
+   986→      try {
+   987→        await updateCatalog(id, attempt.controller.signal);
+   988→      } catch (error) {
+   989→        active(attempt);
+   990→        attempt.error =
+   991→          error instanceof ConnectionError
+   992→            ? error.message
+   993→            : 'Account connected. Refresh the connection to load its models.';
+   994→      }
+   995→      active(attempt);
+   996→      attempt.status = 'connected';
+   997→      connectionChanged(attempt.provider, method, 'connected');
+   998→    } catch (error) {
+   999→      const cause = error instanceof Error ? (error.cause ?? error) : error;
+  1000→      logFailure('model_sign_in_failed', cause, signInFailure(attempt, cause));
+  1001→      if (!attempt.controller.signal.aborted) connectionChanged(attempt.provider, method, 'failed');
+  1002→      attempt.status = 'failed';
+  1003→      attempt.error =
+  1004→        error instanceof ConnectionError || error instanceof ModelAuthError
+  1005→          ? error.message
+  1006→          : 'Sign-in failed. Start a new connection.';
+  1007→      throw error;
+  1008→    } finally {
+  1009→      attempt.secret = {};
+  1010→    }
+  1011→  }
+  1012→  async function completeCallback(callback: URL) {
+  1013→    const attempt = attempts.get(callback.searchParams.get('state') ?? '');
+  1014→    await (attempt?.completion &&
+  1015→    attempt.status !== 'waiting' &&
+  1016→    !closed &&
+  1017→    attempt.expires >= Date.now()
+  1018→      ? attempt.completion
+  1019→      : complete(callback));
+  1020→    return attempt?.provider;
+  1021→  }
+  1022→  function start(provider: 'openai' | 'openrouter', connectionId?: string) {
+  1023→    const result = starting.then(() => begin(provider, connectionId));
+  1024→    starting = result.catch(() => {});
+  1025→    return result;
+  1026→  }
+  1027→  async function begin(provider: 'openai' | 'openrouter', connectionId?: string) {
+  1028→    if (closed) throw new ConnectionError('Model connections have stopped.');
+  1029→    try {
+  1030→      await checkStorage();
+  1031→    } catch (error) {
+  1032→      connectionChanged(provider, provider === 'openai' ? 'subscription' : 'oauth', 'failed');
+  1033→      throw error;
+  1034→    }
+  1035→    const saved = await store.read();
+  1036→    await reload();
+  1037→    const row = connectionId
+  1038→      ? rows.find(
+  1039→          (row) => row.id === connectionId && row.provider === provider && row.method !== 'api_key',
+  1040→        )
+  1041→      : undefined;
+  1042→    if (connectionId && !row) throw new ConnectionError('This model connection is unavailable.');
+  1043→    for (const [state, attempt] of attempts)
+  1044→      if (
+  1045→        attempt.expires < Date.now() ||
+  1046→        (provider === 'openai' &&
+  1047→          attempt.provider === provider &&
+  1048→          (attempt.controller.signal.aborted || ['waiting', 'completing'].includes(attempt.status)))
+  1049→      )
+  1050→        await cancel(state, attempt.expires < Date.now() ? 'timeout' : 'superseded');
+  1051→    if (closed) throw new ConnectionError('Model connections have stopped.');
+  1052→    const controller = new AbortController();
+  1053→    pendingControllers.add(controller);
+  1054→    let flow: Awaited<ReturnType<ModelBackend['signIn']>> | undefined;
+  1055→    const started = Date.now();
+  1056→    let timedOut = false;
+  1057→    const timeout = setTimeout(() => {
+  1058→      timedOut = true;
+  1059→      controller.abort();
+  1060→    }, 15000);
+  1061→    timeout.unref();
+  1062→    try {
+  1063→      const auth =
+  1064→        provider === 'openai'
+  1065→          ? await backend.signIn({
+  1066→              signal: controller.signal,
+  1067→              hostId: saved.hostId,
+  1068→              previous: saved.connections.find((item) => item.id === row?.id)?.credential,
+  1069→            })
+  1070→          : backend.authorize({
+  1071→              provider,
+  1072→              redirectUri: `${options.origin}/api/models/oauth/callback`,
+  1073→            });
+  1074→      flow = 'result' in auth ? auth : undefined;
+  1075→      flow?.result.catch(() => {});
+  1076→      controller.signal.throwIfAborted();
+  1077→      const timer = setTimeout(() => {
+  1078→        void cancel(auth.state, 'timeout');
+  1079→      }, 600000);
+  1080→      timer.unref();
+  1081→      const attempt: NonNullable<ReturnType<typeof attempts.get>> = {
+  1082→        provider,
+  1083→        state: auth.state,
+  1084→        controller,
+  1085→        complete: flow?.complete,
+  1086→        connectionId,
+  1087→        secret: 'secret' in auth ? auth.secret : {},
+  1088→        expires: Date.now() + 600000,
+  1089→        timer,
+  1090→        status: 'waiting',
+  1091→      };
+  1092→      attempts.set(auth.state, attempt);
+  1093→      if (flow) {
+  1094→        attempt.completion = finish(attempt, flow.result);
+  1095→        attempt.completion.catch(() => {});
+  1096→      }
+  1097→      return { url: auth.url, attempt: auth.state };
+  1098→    } catch (error) {
+  1099→      const cause = error instanceof Error ? (error.cause ?? error) : error;
+  1100→      logFailure('model_sign_in_failed', cause, {
+  1101→        provider,
+  1102→        reason: timedOut ? 'timeout' : closed ? 'shutdown' : Object(cause).reason,
+  1103→        phase: 'start',
+  1104→        elapsedMs: Date.now() - started,
+  1105→      });
+  1106→      controller.abort();
+  1107→      await flow?.result.catch(() => {});
+  1108→      throw error;
+  1109→    } finally {
+  1110→      clearTimeout(timeout);
+  1111→      pendingControllers.delete(controller);
+  1112→    }
+  1113→  }
+  1114→  const service = {
+  1115→    get configured() {
+  1116→      return usable(rows, selection);
+  1117→    },
+  1118→    get current() {
+  1119→      const row = rows.find((item) => item.id === selection?.connectionId);
+  1120→      const chosen = row?.models.find((model) => model.choice.id === selection?.modelId);
+  1121→      return {
+  1122→        provider: row?.provider ?? 'unconfigured',
+  1123→        name: selection?.modelId ?? 'Unconfigured',
+  1124→        label: chosen?.choice.name ?? selection?.modelId,
+  1125→        configured: service.configured,
+  1126→        reconnect: row?.status === 'reconnect',
+  1127→        issue: selection ? service.issue(selection) : undefined,
+  1128→      };
+  1129→    },
+  1130→    issue(choice: Pick<ModelSelection, 'connectionId' | 'modelId'>) {
+  1131→      const row = rows.find((item) => item.id === choice.connectionId);
+  1132→      return requested(row, choice.modelId)
+  1133→        .map((id) => row?.issues?.[id])
+  1134→        .find(Boolean);
+  1135→    },
+  1136→    paused(origin: WorkOrigin) {
+  1137→      try {
+  1138→        const { selection: work } = service.workModel(origin);
+  1139→        const row = rows.find((item) => item.id === work.connectionId);
+  1140→        return requested(row, work.modelId).some((id) => (row?.retry?.[id] ?? 0) > Date.now());
+  1141→      } catch {
+  1142→        return false;
+  1143→      }
+  1144→    },
+  1145→    async automaticRequestsAllowed(origin: WorkOrigin, auxiliary = false) {
+  1146→      try {
+  1147→        const work = service.workModel(origin);
+  1148→        for (const access of [
+  1149→          await service.resolve(false, work.selection),
+  1150→          ...(auxiliary ? [await service.resolve(true)] : []),
+  1151→        ]) {
+  1152→          await access.prepareRequest?.(
+  1153→            access.textModel?.definition.choice.id ?? access.definition.choice.id,
+  1154→            true,
+  1155→          );
+  1156→        }
+  1157→        return true;
+  1158→      } catch {
+  1159→        return false;
+  1160→      }
+  1161→    },
+  1162→    light: lightModel,
+  1163→    unpricedPreparationModel,
+  1164→    priceOf(choice: ModelSelection | null | undefined) {
+  1165→      const definition = rows
+  1166→        .find((row) => row.id === choice?.connectionId)
+  1167→        ?.models.find((model) => model.choice.id === choice?.modelId);
+  1168→      return definition && { modelId: definition.choice.id, pricing: modelPricing(definition) };
+  1169→    },
+  1170→    pricing(kind: WorkKind, own: ModelSelection | null = null) {
+  1171→      return service.priceOf(
+  1172→        routeModel({ connections: rows, selection, routes, light: lightModel() }, kind, {
+  1173→          schedule: own,
+  1174→        })?.selection,
+  1175→      );
+  1176→    },
+  1177→    describe(choice: ModelSelection) {
+  1178→      const row = rows.find((item) => item.id === choice.connectionId);
+  1179→      return {
+  1180→        provider: row?.provider ?? 'unconfigured',
+  1181→        name: choice.modelId,
+  1182→        label:
+  1183→          row?.models.find((model) => model.choice.id === choice.modelId)?.choice.name ??
+  1184→          choice.modelId,
+  1185→        configured: usable(rows, choice),
+  1186→      };
+  1187→    },
+  1188→    validateChoice(value: ModelSelection) {
+  1189→      const choice = modelSelectionInput.parse(value);
+  1190→      textChoice(rows, choice);
+  1191→      return choice;
+  1192→    },
+  1193→    workModel(origin: WorkOrigin): WorkModel {
+  1194→      const work = routeModel(
+  1195→        { connections: rows, selection, routes, light: lightModel() },
+  1196→        origin.kind,
+  1197→        origin,
+  1198→      );
+  1199→      if (!work)
+  1200→        throw new ConnectionError(
+  1201→          `Open ${appPages['/settings/models']}. Connect a service and choose a model.`,
+  1202→        );
+  1203→      if (work.follows === 'chat' || work.follows === 'light') return work;
+  1204→      const row = rows.find((item) => item.id === work.selection.connectionId);
+  1205→      const definition = row?.models.find((model) => model.choice.id === work.selection.modelId);
+  1206→      if (row?.status !== 'connected' || !definition || definition.choice.audio)
+  1207→        throw unavailable(work, origin.kind, row);
+  1208→      if (definition.choice.efforts.includes(work.selection.effort)) return work;
+  1209→      return {
+  1210→        ...work,
+  1211→        selection: { ...work.selection, effort: defaultEffort(row.provider, definition.choice) },
+  1212→      };
+  1213→    },
+  1214→    async setRoute(
+  1215→      lane: ModelLane,
+  1216→      value: ModelRoute | null,
+  1217→      actor: SettingActor = 'owner',
+  1218→      client?: PoolClient,
+  1219→    ) {
+  1220→      const route = modelRouteInput.parse(value);
+  1221→      const capture = snapshotAnalytics(analytics);
+  1222→      const changed = await store.change(
+  1223→        (state) => {
+  1224→          if (route && route !== 'light') textChoice(state.connections, route);
+  1225→          const before = JSON.stringify(state.routes[lane] ?? null);
+  1226→          state.routes = { ...state.routes, [lane]: route };
+  1227→          return { changed: before !== JSON.stringify(route), routes: state.routes };
+  1228→        },
+  1229→        undefined,
+  1230→        client,
+  1231→      );
+  1232→      if (changed.changed)
+  1233→        capture?.({
+  1234→          event: 'setting_changed',
+  1235→          properties: {
+  1236→            setting: lane === 'schedule' ? 'model_route_schedule' : 'model_route_background',
+  1237→            actor,
+  1238→            state: routeState(route),
+  1239→          },
+  1240→        });
+  1241→      await settle(client, () => {
+  1242→        routes = changed.routes;
+  1243→      });
+  1244→    },
+  1245→    onSecrets(observer: (values: string[]) => void) {
+  1246→      observers.add(observer);
+  1247→      observer([...secrets]);
+  1248→      return () => observers.delete(observer);
+  1249→    },
+  1250→    view(): ModelsResponse {
+  1251→      const unpriced = unpricedPreparationModel();
+  1252→      return {
+  1253→        connections: rows.map(
+  1254→          ({ id, provider, method, label, status, managed, models, keyEnding, issue }) => ({
+  1255→            id,
+  1256→            provider,
+  1257→            method,
+  1258→            label,
+  1259→            status,
+  1260→            managed,
+  1261→            ...(issue ? { issue } : {}),
+  1262→            models: models.map((model) => ({
+  1263→              ...model.choice,
+  1264→              pricing: modelPricing(model),
+  1265→              ...(model.choice.audio
+  1266→                ? { textModelName: textCompanion({ provider, method, models })?.choice.name }
+  1267→                : {}),
+  1268→            })),
+  1269→            ...(keyEnding ? { keyEnding } : {}),
+  1270→          }),
+  1271→        ),
+  1272→        selection,
+  1273→        routes,
+  1274→        light: lightModel(),
+  1275→        ...(unpriced ? { unpricedPreparationModel: unpriced } : {}),
+  1276→      };
+  1277→    },
+  1278→    async initialize() {
+  1279→      await store.initialize();
+  1280→      initialized = true;
+  1281→      await store.change((state) => {
+  1282→        state.connections = state.connections.filter(
+  1283→          (row) => !row.managed || options.bootstrap?.credentials[row.provider],
+  1284→        );
+  1285→        if (!state.connections.some((row) => row.id === state.selection?.connectionId))
+  1286→          state.selection = null;
+  1287→        for (const row of state.connections) {
+  1288→          try {
+  1289→            if (!credential(row)) row.status = 'reconnect';
+  1290→          } catch {
+  1291→            row.status = 'reconnect';
+  1292→          }
+  1293→        }
+  1294→      });
+  1295→      await reload();
+  1296→      const sources = Object.entries(options.bootstrap?.credentials ?? {}).sort(
+  1297→        ([a], [b]) =>
+  1298→          Number(b === options.bootstrap?.provider) - Number(a === options.bootstrap?.provider),
+  1299→      );
+  1300→      for (const [provider, value] of sources) {
+  1301→        if (!value) continue;
+  1302→        const existing = rows.find((row) => row.provider === provider && row.managed);
+  1303→        let definitions: ModelDefinition[] | undefined;
+  1304→        try {
+  1305→          definitions = await catalog(provider as ModelProvider, 'api_key', value);
+  1306→        } catch {}
+  1307→        const connected =
+  1308→          definitions !== undefined &&
+  1309→          (definitions.length > 0 ||
+  1310→            modelProviderInfo[provider as ModelProvider].speechOnly === true);
+  1311→        await save(
+  1312→          provider as ModelProvider,
+  1313→          'api_key',
+  1314→          value,
+  1315→          connected ? definitions! : (existing?.models ?? []),
+  1316→          existing?.id,
+  1317→          { managed: true, status: connected ? 'connected' : 'reconnect' },
+  1318→        );
+  1319→      }
+  1320→    },
+  1321→    async addKey(
+  1322→      provider: ModelProvider,
+  1323→      key: string,
+  1324→      settings: {
+  1325→        region?: string;
+  1326→        url?: string;
+  1327→        model?: string;
+  1328→        deployment?: string;
+  1329→        accountId?: string;
+  1330→        gatewayId?: string;
+  1331→        workspaceId?: string;
+  1332→      } = {},
+  1333→    ) {
+  1334→      key = key.trim();
+  1335→      const error = modelKeyError(provider, key);
+  1336→      if (error) throw new ConnectionError(error);
+  1337→      const value = modelKeyCredential(provider, key, settings);
+  1338→      remember(value);
+  1339→      return tracked(provider, 'api_key', async () => {
+  1340→        await checkStorage();
+  1341→        if (backend.connectKey) {
+  1342→          const connected = await backend.connectKey(provider, value).catch((error) => {
+  1343→            if (error instanceof ModelWorkspaceSelectionError) throw error;
+  1344→            throw new ConnectionError(
+  1345→              error instanceof ModelAuthError
+  1346→                ? error.message
+  1347→                : 'The model list couldn’t be loaded. Try again.',
+  1348→            );
+  1349→          });
+  1350→          return save(provider, 'api_key', connected.credential, connected.models);
+  1351→        }
+  1352→        return save(provider, 'api_key', value, await catalog(provider, 'api_key', value));
+  1353→      });
+  1354→    },
+  1355→    async addEndpoint(address: string, key?: string) {
+  1356→      const url = endpointAddress(address);
+  1357→      if (!url)
+  1358→        throw new ConnectionError('Enter a server address such as http://localhost:11434/v1.');
+  1359→      const value: ModelCredential = { type: 'endpoint', url, ...(key ? { key } : {}) };
+  1360→      remember(value);
+  1361→      return tracked('compatible', 'api_key', async () => {
+  1362→        await checkStorage();
+  1363→        const definitions = await backend.catalog('compatible', 'api_key', value).catch(() => {
+  1364→          throw new ConnectionError(
+  1365→            'Nod couldn’t list this server’s models. Check the address, the API key and that the server is running.',
+  1366→          );
+  1367→        });
+  1368→        if (!definitions.length)
+  1369→          throw new ConnectionError(
+  1370→            'This server has no models Nod can use. Nod needs models with tool support.',
+  1371→          );
+  1372→        return save('compatible', 'api_key', value, definitions);
+  1373→      });
+  1374→    },
+  1375→    async select(input: ModelSelection, actor: SettingActor = 'owner', client?: PoolClient) {
+  1376→      const value = modelSelectionInput.parse(input);
+  1377→      checked = undefined;
+  1378→      const capture = snapshotAnalytics(analytics);
+  1379→      const changed = await store.change(
+  1380→        (state) => {
+  1381→          const row = state.connections.find((item) => item.id === value.connectionId);
+  1382→          const model =
+  1383→            row?.status === 'connected' &&
+  1384→            row.models.find((item) => item.choice.id === value.modelId);
+  1385→          if (!row || !model || !model.choice.efforts.includes(value.effort))
+  1386→            throw new ConnectionError('Choose an available model and effort.');
+  1387→          if (model.choice.audio && !textCompanion(row)) throw missingTextCompanion();
+  1388→          const changed = {
+  1389→            model:
+  1390→              state.selection?.connectionId !== value.connectionId ||
+  1391→              state.selection?.modelId !== value.modelId,
+  1392→            effort: state.selection?.effort !== value.effort,
+  1393→          };
+  1394→          state.selection = value;
+  1395→          state.selectionSet = true;
+  1396→          return changed;
+  1397→        },
+  1398→        undefined,
+  1399→        client,
+  1400→      );
+  1401→      const apply = () => {
+  1402→        selection = value;
+  1403→      };
+  1404→      if (changed.model)
+  1405→        capture?.({
+  1406→          event: 'setting_changed',
+  1407→          properties: { setting: 'model_selection', actor, state: 'configured' },
+  1408→        });
+  1409→      if (changed.effort)
+  1410→        capture?.({
+  1411→          event: 'setting_changed',
+  1412→          properties: { setting: 'model_effort', actor, state: value.effort },
+  1413→        });
+  1414→      await settle(client, apply);
+  1415→    },
+  1416→    async remove(id: string) {
+  1417→      const capture = snapshotAnalytics(analytics);
+  1418→      for (const [state, attempt] of attempts)
+  1419→        if (attempt.connectionId === id) await cancel(state, 'connection_removed');
+  1420→      const removed = await store.change((state) => {
+  1421→        const row = state.connections.find((item) => item.id === id);
+  1422→        if (row?.managed)
+  1423→          throw new ConnectionError('This connection is managed in server settings.');
+  1424→        state.connections = state.connections.filter((item) => item.id !== id);
+  1425→        const selectionCleared = state.selection?.connectionId === id;
+  1426→        if (selectionCleared) state.selection = null;
+  1427→        state.routes = Object.fromEntries(
+  1428→          Object.entries(state.routes).filter(
+  1429→            ([, route]) => route === 'light' || route?.connectionId !== id,
+  1430→          ),
+  1431→        );
+  1432→        return { row, selectionCleared };
+  1433→      });
+  1434→      if (removed.selectionCleared)
+  1435→        for (const setting of ['model_selection', 'model_effort'] as const)
+  1436→          capture?.({
+  1437→            event: 'setting_changed',
+  1438→            properties: { setting, actor: 'owner', state: 'cleared' },
+  1439→          });
+  1440→      await reload();
+  1441→      if (removed.row && capture)
+  1442→        connectionChanged(removed.row.provider, removed.row.method, 'disconnected', capture);
+  1443→    },
+  1444→    analyticsConnections() {
+  1445→      return rows.flatMap((row) => {
+  1446→        const provider = row.provider;
+  1447→        if (provider === 'elevenlabs') return [];
+  1448→        const selected = row.id === selection?.connectionId;
+  1449→        return [
+  1450→          {
+  1451→            provider,
+  1452→            method: row.method,
+  1453→            selected,
+  1454→            ...(selected && selection
+  1455→              ? {
+  1456→                  ...analyticsModel(provider, selection.modelId),
+  1457→                  provider,
+  1458→                  effort: selection.effort,
+  1459→                }
+  1460→              : {}),
+  1461→          },
+  1462→        ];
+  1463→      });
+  1464→    },
+  1465→    refreshCatalog,
+  1466→    hasApiKey(provider: ModelProvider) {
+  1467→      return Boolean(apiKeyConnection(provider));
+  1468→    },
+  1469→    async apiCredential(provider: ModelProvider) {
+  1470→      const row = apiKeyConnection(provider);
+  1471→      const value = row && (await read(row.id));
+  1472→      return value?.type === 'api_key' ? value : undefined;
+  1473→    },
+  1474→    async apiKey(provider: ModelProvider) {
+  1475→      return (await service.apiCredential(provider))?.key;
+  1476→    },
+  1477→    hasImageModel() {
+  1478→      return Boolean(imageModel());
+  1479→    },
+  1480→    async resolveImage(): Promise<ModelAccess> {
+  1481→      const candidate = imageModel();
+  1482→      if (!candidate) throw new ConnectionError('Connect a model that accepts images in Models.');
+  1483→      const { row, definition } = candidate;
+  1484→      return {
+  1485→        provider: row.provider,
+  1486→        method: row.method,
+  1487→        definition,
+  1488→        effort: lightestEffort(definition.choice.efforts),
+  1489→        ...requestAccess(row),
+  1490→        needsReconnect: (credential) => needsReconnect(row.id, { models: row.models, credential }),
+  1491→      };
+  1492→    },
+  1493→    hasClassificationModel(otherConnections = false) {
+  1494→      return Boolean(classificationModel(otherConnections));
+  1495→    },
+  1496→    async resolveClassification(otherConnections = false): Promise<ModelAccess | undefined> {
+  1497→      const candidate = classificationModel(otherConnections);
+  1498→      if (!candidate) return undefined;
+  1499→      const { row, definition } = candidate;
+  1500→      return {
+  1501→        provider: row.provider,
+  1502→        method: row.method,
+  1503→        definition,
+  1504→        effort: lightestEffort(definition.choice.efforts),
+  1505→        ...requestAccess(row),
+  1506→        needsReconnect: (credential) => needsReconnect(row.id, { models: row.models, credential }),
+  1507→      };
+  1508→    },
+  1509→    reserve,
+  1510→    setRequestBudget(reserve: NonNullable<ModelAccess['reserve']>) {
+  1511→      requestBudget = reserve;
+  1512→    },
+  1513→    async setSelectionCheck(check: () => Promise<unknown>) {
+  1514→      selectionCheck = check;
+  1515→      if (initialized)
+  1516→        await store
+  1517→          .read()
+  1518→          .then(checkSelection, (error: unknown) => logFailure('model_check_failed', error));
+  1519→    },
+  1520→    async checkSettled() {
+  1521→      await Promise.race([
+  1522→        pendingCheck,
+  1523→        new Promise((resolve) => setTimeout(resolve, 15_000).unref()),
+  1524→      ]);
+  1525→    },
+  1526→    async resolve(
+  1527→      auxiliary = false,
+  1528→      choice: ModelSelection | null = selection,
+  1529→    ): Promise<ModelAccess> {
+  1530→      const { selected, row, definition, companion } = chosen(auxiliary, choice);
+  1531→      return {
+  1532→        provider: row.provider,
+  1533→        method: row.method,
+  1534→        definition,
+  1535→        effort: auxiliary
+  1536→          ? (definition.choice.efforts.find((level) => ['off', 'low', 'medium'].includes(level)) ??
+  1537→            definition.choice.efforts[0])
+  1538→          : selected.effort,
+  1539→        ...(companion
+  1540→          ? {
+  1541→              textModel: {
+  1542→                definition: companion,
+  1543→                effort: auxiliary
+  1544→                  ? lightestEffort(companion.choice.efforts)
+  1545→                  : defaultEffort(row.provider, companion.choice),
+  1546→              },
+  1547→            }
+  1548→          : {}),
+  1549→        ...requestAccess(row),
+  1550→        needsReconnect: (credential) => needsReconnect(row.id, { models: row.models, credential }),
+  1551→      };
+  1552→    },
+  1553→    start,
+  1554→    cancel,
+  1555→    complete,
+  1556→    signInStatus,
+  1557→    register(app: FastifyInstance, capture?: CaptureAnalytics) {
+  1558→      analytics = capture;
+  1559→      void app.register(async (routes) => {
+  1560→        routes.setErrorHandler((error, _request, reply) =>
+  1561→          reply.code(400).send({
+  1562→            error:
+  1563→              error instanceof ConnectionError || error instanceof ModelAuthError
+  1564→                ? error.message
+  1565→                : 'The model connection request failed. Check the service and try again.',
+  1566→            ...(error instanceof ModelWorkspaceSelectionError
+  1567→              ? { workspaces: error.workspaces }
+  1568→              : {}),
+  1569→          }),
+  1570→        );
+  1571→        routes.get('/api/models', async () => service.view());
+  1572→        routes.post('/api/models/keys', async (request) => {
+  1573→          const { provider, key, ...settings } = keySchema.parse(request.body);
+  1574→          await service.addKey(provider, key, settings);
+  1575→          await service.checkSettled();
+  1576→          return service.view();
+  1577→        });
+  1578→        routes.get('/api/models/azure', async () => ({
+  1579→          models: (await catalog('azure', 'api_key')).map(({ choice }) => ({
+  1580→            id: choice.id,
+  1581→            name: choice.name,
+  1582→          })),
+  1583→        }));
+  1584→        routes.post('/api/models/endpoints', async (request) => {
+  1585→          const input = z
+  1586→            .object({
+  1587→              url: z.string().trim().min(1).max(2000),
+  1588→              key: z.string().trim().max(32000).optional(),
+  1589→            })
+  1590→            .strict()
+  1591→            .parse(request.body);
+  1592→          await service.addEndpoint(input.url, input.key || undefined);
+  1593→          await service.checkSettled();
+  1594→          return service.view();
+  1595→        });
+  1596→        routes.put('/api/models/selection', async (request) => {
+  1597→          await service.select(modelSelectionInput.parse(request.body));
+  1598→          await service.checkSettled();
+  1599→          return service.view();
+  1600→        });
+  1601→        routes.put('/api/models/routes', async (request) => {
+  1602→          const input = z
+  1603→            .object({ lane: z.enum(['schedule', 'background']), route: modelRouteInput })
+  1604→            .strict()
+  1605→            .parse(request.body);
+  1606→          await service.setRoute(input.lane, input.route);
+  1607→          return service.view();
+  1608→        });
+  1609→        routes.delete<{ Params: { id: string } }>(
+  1610→          '/api/models/connections/:id',
+  1611→          async (request) => {
+  1612→            await service.remove(z.uuid().parse(request.params.id));
+  1613→            return service.view();
+  1614→          },
+  1615→        );
+  1616→        routes.post<{ Params: { id: string } }>(
+  1617→          '/api/models/connections/:id/refresh',
+  1618→          async (request) => {
+  1619→            await service.refreshCatalog(z.uuid().parse(request.params.id));
+  1620→            return service.view();
+  1621→          },
+  1622→        );
+  1623→        routes.post('/api/models/oauth', async (request) => {
+  1624→          const input = z
+  1625→            .object({
+  1626→              provider: z.enum(['openai', 'openrouter']),
+  1627→              connectionId: z.uuid().optional(),
+  1628→            })
+  1629→            .strict()
+  1630→            .parse(request.body);
+  1631→          return start(input.provider, input.connectionId);
+  1632→        });
+  1633→        routes.get<{ Params: { attempt: string } }>(
+  1634→          '/api/models/oauth/status/:attempt',
+  1635→          async (request, reply) => {
+  1636→            reply.header('Cache-Control', 'no-store');
+  1637→            return signInStatus(
+  1638→              z
+  1639→                .string()
+  1640→                .regex(/^[A-Za-z0-9_-]{32,128}$/)
+  1641→                .parse(request.params.attempt),
+  1642→            );
+  1643→          },
+  1644→        );
+  1645→        routes.delete<{ Params: { attempt: string } }>(
+  1646→          '/api/models/oauth/:attempt',
+  1647→          async (request) => {
+  1648→            await cancel(
+  1649→              z
+  1650→                .string()
+  1651→                .regex(/^[A-Za-z0-9_-]{32,128}$/)
+  1652→                .parse(request.params.attempt),
+  1653→              'client_cancelled',
+  1654→            );
+  1655→            return service.view();
+  1656→          },
+  1657→        );
+  1658→        routes.post('/api/models/oauth/complete', async (request) => {
+  1659→          const input = z
+  1660→            .object({ url: z.url().max(64000) })
+  1661→            .strict()
+  1662→            .parse(request.body);
+  1663→          await complete(new URL(input.url));
+  1664→          await service.checkSettled();
+  1665→          return service.view();
+  1666→        });
+  1667→        routes.get('/api/models/oauth/callback', async (request, reply) => {
+  1668→          let succeeded = false;
+  1669→          let provider: 'ChatGPT' | 'OpenRouter' | undefined;
+  1670→          try {
+  1671→            const connected = await completeCallback(new URL(request.url, options.origin));
+  1672→            provider = connected === 'openai' ? 'ChatGPT' : 'OpenRouter';
+  1673→            succeeded = true;
+  1674→          } catch {}
+  1675→          const page = signInPage(succeeded, randomUUID(), provider);
+  1676→          return reply
+  1677→            .code(succeeded ? 200 : 400)
+  1678→            .headers(page.headers)
+  1679→            .send(page.html);
+  1680→        });
+  1681→      });
+  1682→    },
+  1683→    async close() {
+  1684→      closed = true;
+  1685→      for (const controller of pendingControllers) controller.abort();
+  1686→      await starting;
+  1687→      await Promise.all([...attempts.keys()].map((state) => cancel(state, 'shutdown')));
+  1688→      observers.clear();
+  1689→      secrets.clear();
+  1690→    },
+  1691→  };
+  1692→  return service;
+  1693→}
+  1694→

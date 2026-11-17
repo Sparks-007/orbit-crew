@@ -1,0 +1,1083 @@
+     1→type FrameNode = {
+     2→  frame: { id: string; loaderId?: string; securityOrigin?: string };
+     3→  childFrames?: FrameNode[];
+     4→};
+     5→type Waiter = { resolve(value: unknown): void; reject(error: Error): void };
+     6→type DomNode = {
+     7→  backendNodeId: number;
+     8→  frameId?: string;
+     9→  shadowRootType?: string;
+    10→  children?: DomNode[];
+    11→  shadowRoots?: DomNode[];
+    12→  contentDocument?: DomNode;
+    13→};
+    14→export type BoundSignInControl = {
+    15→  backendNodeId: number;
+    16→  frameId: string;
+    17→  targetFrameId: string;
+    18→  loaderId: string;
+    19→  snapshot: string;
+    20→  controls: { role: string; name: string }[];
+    21→  origin: string;
+    22→  url: string;
+    23→  submits: { method: string; to: string } | null;
+    24→};
+    25→type FocusedField = { origin: string; session: string; context: number };
+    26→type ControlQuery = {
+    27→  selector?: string;
+    28→  point?: { x: number; y: number };
+    29→  pixel?: { x: number; y: number };
+    30→  focused?: boolean;
+    31→};
+    32→
+    33→const active = `(() => { if (!document.hasFocus()) return null; let node = document.activeElement; for (;;) { const root = node && (node.shadowRoot ?? (globalThis.__nodRoots ?? []).find(root => root.host === node)); if (!root?.activeElement) break; node = root.activeElement; } return node && !['IFRAME', 'FRAME', 'BODY', 'HTML'].includes(node.tagName) ? node : null; })()`;
+    34→const focusScript = `(() => { const node = ${active}; globalThis.__nodFocused = node; return node ? node.tagName : ''; })()`;
+    35→const submitsScript = `function (enter) { const node = this.nodeType === 1 ? this : this.parentElement; const control = enter ? node : (node?.closest('button, input') ?? node?.closest('label')?.control); const form = control?.form; const button = ['submit', 'image'].includes(control?.type); if (!form || !(button || (enter && control.tagName === 'INPUT'))) return null; const own = (name) => Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, name).get.call(form); const submitter = button ? control : [...own('elements')].find((element) => ['submit', 'image'].includes(element.type)); const method = (submitter?.hasAttribute('formmethod') ? submitter.formMethod : own('method')) || 'get'; if (method === 'dialog') return null; return { method: method.toUpperCase(), to: submitter?.hasAttribute('formaction') ? submitter.formAction : own('action') }; }`;
+    36→const signInControlSelector =
+    37→  'button, a[href], input[type="submit"], input[type="button"], input[type="image"], [role="button"], [role="link"]';
+    38→const signInSnapshot = `function () {
+    39→  if (!this.isConnected || this.ownerDocument !== document || !this.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true }) || this.matches(':disabled') || this.closest('[inert], [aria-disabled="true"], [aria-hidden="true"]')) return null;
+    40→  const rect = this.getBoundingClientRect();
+    41→  if (!rect.width || !rect.height || this.outerHTML.length > 16384) return null;
+    42→  const references = ['aria-labelledby', 'aria-describedby'].map(name => (this.getAttribute(name) ?? '').split(/\\s+/).map(id => document.getElementById(id)?.textContent ?? ''));
+    43→  return JSON.stringify({ origin: location.origin, url: location.href, html: this.outerHTML, href: this instanceof HTMLAnchorElement ? this.href : null, references, submits: (${submitsScript}).call(this, false) });
+    44→}`;
+    45→const blurScript = `(() => { const node = document.activeElement; if (node && node !== document.body && typeof node.blur === 'function') node.blur(); return ''; })()`;
+    46→const armScript = (privateValue: boolean) =>
+    47→  `(() => { const node = ${active}; if (!node || node !== globalThis.__nodFocused) return ''; globalThis.__nodField = node; if (${privateValue}) (globalThis.__nodPrivateFields ??= new Set()).add(node); node.setAttribute('autocomplete', 'off'); if (node.tagName !== 'SELECT') { if (typeof node.select === 'function') node.select(); else document.execCommand('selectAll'); document.execCommand('delete'); } return node.tagName; })()`;
+    48→const maskScript = (on: boolean, secrets: string[], allFields: boolean, snapshot: boolean) =>
+    49→  `(() => {
+    50→    globalThis.__nodMaskObserver?.disconnect();
+    51→    delete globalThis.__nodMaskObserver;
+    52→    const privateFields = [...(globalThis.__nodPrivateFields ?? [])].filter(node => node.isConnected);
+    53→    const types = globalThis.__nodMaskedTypes ??= new Map();
+    54→    for (const [node, type] of types) if (type === null) node.removeAttribute('type'); else node.setAttribute('type', type);
+    55→    types.clear();
+    56→    const styles = globalThis.__nodMaskedStyles ??= new Map();
+    57→    for (const [node, [hadStyle, properties]] of styles) {
+    58→      for (const [property, value, priority] of properties.slice().reverse()) {
+    59→        if (property === 'transition-property') getComputedStyle(node).opacity;
+    60→        if (value) node.style.setProperty(property, value, priority); else node.style.removeProperty(property);
+    61→      }
+    62→      if (!hadStyle && node.getAttribute('style') === '') node.removeAttribute('style');
+    63→    }
+    64→    styles.clear();
+    65→    if (!${on}) return '';
+    66→    const hide = node => {
+    67→      const property = ${snapshot} ? 'visibility' : 'opacity';
+    68→      if (!styles.has(node)) styles.set(node, [node.hasAttribute('style'), ['transition-property', property].map(name => [name, node.style.getPropertyValue(name), node.style.getPropertyPriority(name)])]);
+    69→      if (node.style.getPropertyValue('transition-property') !== 'none' || node.style.getPropertyPriority('transition-property') !== 'important') node.style.setProperty('transition-property', 'none', 'important');
+    70→      const value = ${snapshot} ? 'hidden' : '0';
+    71→      if (node.style.getPropertyValue(property) !== value || node.style.getPropertyPriority(property) !== 'important') node.style.setProperty(property, value, 'important');
+    72→    };
+    73→    const secrets = ${JSON.stringify(secrets)};
+    74→    const scan = ${allFields} || secrets.length;
+    75→    let roots = [];
+    76→    const apply = () => {
+    77→    roots = [...new Set([document, ...(scan ? globalThis.__nodRoots ?? [] : []), ...privateFields.map(node => node.getRootNode())])];
+    78→    if (scan) for (let index = 0; index < roots.length; index++) for (const node of roots[index].querySelectorAll('*')) if (node.shadowRoot) roots.push(node.shadowRoot);
+    79→    const numbers = secrets.filter(secret => /^\\d{12,19}$/.test(secret));
+    80→    const matches = value => typeof value === 'string' && (secrets.some(secret => value.includes(secret)) || numbers.some(secret => value.replace(/\\D/g, '').includes(secret)));
+    81→    for (const root of roots) {
+    82→      const fields = privateFields.filter(node => node.getRootNode() === root);
+    83→      for (const node of new Set([...(scan ? root.querySelectorAll('input,textarea,select') : []), ...fields])) {
+    84→        if (!${allFields} && !(fields.includes(node) && (node.value || node.textContent)) && !matches(node.value)) continue;
+    85→        if (${snapshot} && node.tagName === 'INPUT') {
+    86→          types.set(node, node.getAttribute('type'));
+    87→          node.setAttribute('type', 'password');
+    88→        } else hide(node);
+    89→      }
+    90→      if (secrets.length) {
+    91→        const walk = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    92→        while (walk.nextNode()) if (matches(walk.currentNode.textContent) && walk.currentNode.parentElement) hide(walk.currentNode.parentElement);
+    93→      }
+    94→    }
+    95→    };
+    96→    apply();
+    97→    if (!${snapshot}) {
+    98→      const watch = () => roots.forEach(root => observer.observe(root, { subtree: true, childList: true, characterData: true, attributes: true }));
+    99→      const observer = new MutationObserver(() => { observer.disconnect(); apply(); watch(); });
+   100→      watch();
+   101→      globalThis.__nodMaskObserver = observer;
+   102→    }
+   103→    return '';
+   104→  })()`;
+   105→
+   106→export async function openDevtools(url: string, targetId: string, signal?: AbortSignal) {
+   107→  const address = new URL(url);
+   108→  if (address.protocol !== 'ws:' || !['localhost', '127.0.0.1', '[::1]'].includes(address.hostname))
+   109→    throw new Error('The browser inspector must be local.');
+   110→  signal?.throwIfAborted();
+   111→  const socket = new WebSocket(url);
+   112→  let abort = () => {};
+   113→  await new Promise<void>((resolve, reject) => {
+   114→    const timer = setTimeout(
+   115→      () => reject(new Error('The browser inspector is unavailable.')),
+   116→      10_000,
+   117→    );
+   118→    abort = () => {
+   119→      clearTimeout(timer);
+   120→      reject(signal?.reason);
+   121→    };
+   122→    signal?.addEventListener('abort', abort, { once: true });
+   123→    socket.addEventListener(
+   124→      'open',
+   125→      () => {
+   126→        clearTimeout(timer);
+   127→        resolve();
+   128→      },
+   129→      { once: true },
+   130→    );
+   131→    socket.addEventListener(
+   132→      'error',
+   133→      () => {
+   134→        clearTimeout(timer);
+   135→        reject(new Error('The browser inspector is unavailable.'));
+   136→      },
+   137→      { once: true },
+   138→    );
+   139→  })
+   140→    .finally(() => signal?.removeEventListener('abort', abort))
+   141→    .catch((error: unknown) => {
+   142→      socket.close();
+   143→      throw error;
+   144→    });
+   145→  let next = 0;
+   146→  const pending = new Map<number, Waiter>();
+   147→  const sessions = new Set<string>();
+   148→  const following = new Set<Promise<unknown>>();
+   149→  const worlds = new Map<string, number>();
+   150→  const bindings = new Map<string, (payload: string) => void>();
+   151→  const send = (method: string, params: object = {}, sessionId?: string, cleanup = false) =>
+   152→    new Promise<Record<string, unknown>>((resolve, reject) => {
+   153→      if (!cleanup) signal?.throwIfAborted();
+   154→      const id = ++next;
+   155→      const timer = setTimeout(() => {
+   156→        pending.delete(id);
+   157→        reject(new Error('The browser inspector did not answer.'));
+   158→      }, 10_000);
+   159→      pending.set(id, {
+   160→        resolve: (value) => {
+   161→          clearTimeout(timer);
+   162→          resolve(value as Record<string, unknown>);
+   163→        },
+   164→        reject: (error) => {
+   165→          clearTimeout(timer);
+   166→          reject(error);
+   167→        },
+   168→      });
+   169→      socket.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
+   170→    });
+   171→  const follow = (sessionId: string) => {
+   172→    sessions.add(sessionId);
+   173→    const followed = send(
+   174→      'Target.setAutoAttach',
+   175→      { autoAttach: true, waitForDebuggerOnStart: false, flatten: true },
+   176→      sessionId,
+   177→    ).catch(() => {});
+   178→    following.add(followed);
+   179→    return followed;
+   180→  };
+   181→  socket.addEventListener('message', (event) => {
+   182→    const message = JSON.parse(String(event.data)) as {
+   183→      id?: number;
+   184→      result?: unknown;
+   185→      error?: { message?: string };
+   186→      method?: string;
+   187→      sessionId?: string;
+   188→      params?: {
+   189→        sessionId?: string;
+   190→        name?: string;
+   191→        payload?: string;
+   192→        targetInfo?: { type?: string };
+   193→      };
+   194→    };
+   195→    const waiter = message.id === undefined ? undefined : pending.get(message.id);
+   196→    if (waiter) {
+   197→      pending.delete(message.id!);
+   198→      if (message.error) waiter.reject(new Error(message.error.message ?? 'Inspector error.'));
+   199→      else waiter.resolve(message.result ?? {});
+   200→    } else if (message.method === 'Runtime.bindingCalled' && message.params?.name) {
+   201→      bindings.get(message.params.name)?.(message.params.payload ?? '');
+   202→    } else if (
+   203→      message.method === 'Target.attachedToTarget' &&
+   204→      message.params?.targetInfo?.type === 'iframe' &&
+   205→      message.params.sessionId
+   206→    )
+   207→      void follow(message.params.sessionId);
+   208→    else if (message.method === 'Target.detachedFromTarget' && message.params?.sessionId) {
+   209→      sessions.delete(message.params.sessionId);
+   210→      for (const key of worlds.keys())
+   211→        if (key.startsWith(`${message.params.sessionId}:`)) worlds.delete(key);
+   212→    }
+   213→  });
+   214→  socket.addEventListener('close', () => {
+   215→    for (const waiter of pending.values())
+   216→      waiter.reject(new Error('The browser inspector closed.'));
+   217→    pending.clear();
+   218→  });
+   219→  let page: string;
+   220→  try {
+   221→    ({ sessionId: page } = (await send('Target.attachToTarget', {
+   222→      targetId,
+   223→      flatten: true,
+   224→    })) as {
+   225→      sessionId: string;
+   226→    });
+   227→    void follow(page);
+   228→    while (following.size) {
+   229→      const batch = [...following];
+   230→      following.clear();
+   231→      await Promise.all(batch);
+   232→    }
+   233→  } catch (error) {
+   234→    socket.close();
+   235→    throw error;
+   236→  }
+   237→
+   238→  const tree = async (session: string) => {
+   239→    const frames: FrameNode['frame'][] = [];
+   240→    const walk = (node: FrameNode) => {
+   241→      frames.push(node.frame);
+   242→      for (const child of node.childFrames ?? []) walk(child);
+   243→    };
+   244→    walk((await send('Page.getFrameTree', {}, session)).frameTree as FrameNode);
+   245→    return frames;
+   246→  };
+   247→  const world = async (session: string, frameId: string) => {
+   248→    const key = `${session}:${frameId}`;
+   249→    const known = worlds.get(key);
+   250→    if (known !== undefined) return known;
+   251→    const { executionContextId } = (await send(
+   252→      'Page.createIsolatedWorld',
+   253→      { frameId, worldName: 'nod-private' },
+   254→      session,
+   255→    )) as { executionContextId: number };
+   256→    worlds.set(key, executionContextId);
+   257→    return executionContextId;
+   258→  };
+   259→  const evaluate = async (session: string, context: number, expression: string) => {
+   260→    const { result, exceptionDetails } = (await send(
+   261→      'Runtime.evaluate',
+   262→      { contextId: context, expression, returnByValue: true },
+   263→      session,
+   264→    )) as { result?: { value?: unknown }; exceptionDetails?: unknown };
+   265→    if (exceptionDetails) throw new Error('The page check failed.');
+   266→    return result?.value;
+   267→  };
+   268→
+   269→  async function everyFrame(
+   270→    expression: string,
+   271→    shadows?: 'document' | 'focus',
+   272→    strict = Boolean(shadows),
+   273→  ) {
+   274→    const results: Array<FocusedField & { value: unknown }> = [];
+   275→    for (const session of [...sessions]) {
+   276→      const frames = await tree(session).catch((error) => {
+   277→        if (strict) throw error;
+   278→        return [];
+   279→      });
+   280→      const roots = new Map<string, number[]>();
+   281→      const walk = (node: DomNode, frame: string) => {
+   282→        if (node.shadowRootType === 'closed')
+   283→          roots.set(frame, [...(roots.get(frame) ?? []), node.backendNodeId]);
+   284→        for (const child of [...(node.children ?? []), ...(node.shadowRoots ?? [])])
+   285→          walk(child, frame);
+   286→        if (node.contentDocument) walk(node.contentDocument, node.frameId ?? frame);
+   287→      };
+   288→      if (shadows === 'document' && frames.length) {
+   289→        const { root } = (await send('DOM.getDocument', { depth: -1, pierce: true }, session)) as {
+   290→          root: DomNode;
+   291→        };
+   292→        walk(root, frames[0]!.id);
+   293→      }
+   294→      for (const frame of frames) {
+   295→        try {
+   296→          const context = await world(session, frame.id);
+   297→          if (shadows === 'focus') {
+   298→            const { result } = (await send(
+   299→              'Runtime.evaluate',
+   300→              {
+   301→                contextId: context,
+   302→                expression: `globalThis.__nodRoots = []; ${active}`,
+   303→                objectGroup: 'nod-roots',
+   304→              },
+   305→              session,
+   306→            )) as { result?: { objectId?: string } };
+   307→            if (result?.objectId) {
+   308→              const { node } = (await send(
+   309→                'DOM.describeNode',
+   310→                { objectId: result.objectId, depth: -1, pierce: true },
+   311→                session,
+   312→              )) as { node: DomNode };
+   313→              walk(node, frame.id);
+   314→            }
+   315→          }
+   316→          if (shadows) {
+   317→            const objects = await Promise.all(
+   318→              (roots.get(frame.id) ?? []).map(async (backendNodeId) => {
+   319→                const { object } = (await send(
+   320→                  'DOM.resolveNode',
+   321→                  { backendNodeId, executionContextId: context, objectGroup: 'nod-roots' },
+   322→                  session,
+   323→                )) as { object: { objectId: string } };
+   324→                return { objectId: object.objectId };
+   325→              }),
+   326→            );
+   327→            if (objects.length) {
+   328→              const { exceptionDetails } = await send(
+   329→                'Runtime.callFunctionOn',
+   330→                {
+   331→                  executionContextId: context,
+   332→                  functionDeclaration: 'function(...roots) { globalThis.__nodRoots = roots; }',
+   333→                  arguments: objects,
+   334→                },
+   335→                session,
+   336→              );
+   337→              if (exceptionDetails) throw new Error('The page check failed.');
+   338→            } else if (shadows === 'document')
+   339→              await evaluate(session, context, 'globalThis.__nodRoots = [];');
+   340→          }
+   341→          results.push({
+   342→            origin: frame.securityOrigin ?? '',
+   343→            session,
+   344→            context,
+   345→            value: await evaluate(session, context, expression),
+   346→          });
+   347→        } catch (error) {
+   348→          worlds.delete(`${session}:${frame.id}`);
+   349→          if (strict) throw error;
+   350→        }
+   351→      }
+   352→      if (shadows) await send('Runtime.releaseObjectGroup', { objectGroup: 'nod-roots' }, session);
+   353→    }
+   354→    if (strict && !results.length) throw new Error('The browser inspector is unavailable.');
+   355→    return results;
+   356→  }
+   357→
+   358→  const locate = async (query: ControlQuery, hitTest = false) => {
+   359→    let backendNodeId: number | undefined;
+   360→    let session = page;
+   361→    const describe = async (params: Record<string, unknown>) =>
+   362→      ((await send('DOM.describeNode', params, session)) as { node: { backendNodeId: number } })
+   363→        .node.backendNodeId;
+   364→    if (query.point || query.pixel) {
+   365→      const { cssVisualViewport: view } = (await send('Page.getLayoutMetrics', {}, page)) as {
+   366→        cssVisualViewport: { clientWidth: number; clientHeight: number };
+   367→      };
+   368→      const at = (value: number, size: number) =>
+   369→        Math.max(0, Math.min(Math.ceil(size) - 1, Math.round(value)));
+   370→      const x = at(query.pixel?.x ?? query.point!.x * view.clientWidth, view.clientWidth);
+   371→      const y = at(query.pixel?.y ?? query.point!.y * view.clientHeight, view.clientHeight);
+   372→      ({ backendNodeId } = (await send(
+   373→        'DOM.getNodeForLocation',
+   374→        { x, y, ignorePointerEventsNone: !hitTest },
+   375→        page,
+   376→      )) as { backendNodeId?: number });
+   377→      const owner = backendNodeId
+   378→        ? (
+   379→            (await send('DOM.describeNode', { backendNodeId }, page)) as {
+   380→              node: { nodeName: string; frameId?: string };
+   381→            }
+   382→          ).node
+   383→        : undefined;
+   384→      if (owner?.frameId && ['IFRAME', 'FRAME'].includes(owner.nodeName)) {
+   385→        for (const child of [...sessions].filter((item) => item !== page)) {
+   386→          if ((await tree(child).catch(() => []))[0]?.id !== owner.frameId) continue;
+   387→          const { model } = (await send('DOM.getBoxModel', { backendNodeId }, page)) as {
+   388→            model: { content: number[] };
+   389→          };
+   390→          const inner = (await send(
+   391→            'DOM.getNodeForLocation',
+   392→            {
+   393→              x: Math.round(x - model.content[0]!),
+   394→              y: Math.round(y - model.content[1]!),
+   395→              ignorePointerEventsNone: !hitTest,
+   396→            },
+   397→            child,
+   398→          ).catch(() => undefined)) as { backendNodeId?: number } | undefined;
+   399→          if (inner?.backendNodeId) {
+   400→            backendNodeId = inner.backendNodeId;
+   401→            session = child;
+   402→          }
+   403→          break;
+   404→        }
+   405→      }
+   406→    } else if (query.selector) {
+   407→      const { root } = (await send('DOM.getDocument', { depth: 0 }, page)) as {
+   408→        root: { nodeId: number };
+   409→      };
+   410→      const { nodeId } = (await send(
+   411→        'DOM.querySelector',
+   412→        { nodeId: root.nodeId, selector: query.selector },
+   413→        page,
+   414→      )) as { nodeId: number };
+   415→      if (nodeId) backendNodeId = await describe({ nodeId });
+   416→    } else if (query.focused) {
+   417→      const hits = (await everyFrame(focusScript, 'focus').catch(() => [])).filter(
+   418→        (item) => item.value,
+   419→      );
+   420→      const hit = hits.length === 1 ? hits[0]! : undefined;
+   421→      if (hit) {
+   422→        session = hit.session;
+   423→        const { result } = (await send(
+   424→          'Runtime.evaluate',
+   425→          {
+   426→            contextId: hit.context,
+   427→            expression: 'globalThis.__nodFocused',
+   428→            objectGroup: 'nod-control',
+   429→          },
+   430→          session,
+   431→        )) as { result?: { objectId?: string } };
+   432→        if (result?.objectId) backendNodeId = await describe({ objectId: result.objectId });
+   433→        await send('Runtime.releaseObjectGroup', { objectGroup: 'nod-control' }, session);
+   434→      }
+   435→      const [main] = backendNodeId ? [] : await tree(page);
+   436→      if (main) {
+   437→        session = page;
+   438→        const { result } = (await send(
+   439→          'Runtime.evaluate',
+   440→          {
+   441→            contextId: await world(page, main.id),
+   442→            expression:
+   443→              '(() => { let node = document.activeElement; while (node?.shadowRoot?.activeElement) node = node.shadowRoot.activeElement; return node === document.body && !node.isContentEditable ? null : node; })()',
+   444→            objectGroup: 'nod-control',
+   445→          },
+   446→          page,
+   447→        )) as { result?: { objectId?: string } };
+   448→        if (result?.objectId) backendNodeId = await describe({ objectId: result.objectId });
+   449→        await send('Runtime.releaseObjectGroup', { objectGroup: 'nod-control' }, page);
+   450→      }
+   451→    }
+   452→    return backendNodeId ? { backendNodeId, session } : undefined;
+   453→  };
+   454→
+   455→  const formOf = async (found: { backendNodeId: number; session: string }, enter: boolean) => {
+   456→    const [frame] = await tree(found.session);
+   457→    if (!frame) throw new Error('The control is not in an open frame.');
+   458→    const { object } = (await send(
+   459→      'DOM.resolveNode',
+   460→      {
+   461→        backendNodeId: found.backendNodeId,
+   462→        executionContextId: await world(found.session, frame.id),
+   463→        objectGroup: 'nod-control',
+   464→      },
+   465→      found.session,
+   466→    )) as { object: { objectId: string } };
+   467→    try {
+   468→      const { result, exceptionDetails } = (await send(
+   469→        'Runtime.callFunctionOn',
+   470→        {
+   471→          objectId: object.objectId,
+   472→          functionDeclaration: submitsScript,
+   473→          arguments: [{ value: enter }],
+   474→          returnByValue: true,
+   475→        },
+   476→        found.session,
+   477→      )) as {
+   478→        result?: { value?: { method?: unknown; to?: unknown } | null };
+   479→        exceptionDetails?: unknown;
+   480→      };
+   481→      if (exceptionDetails) throw new Error('The control could not be inspected.');
+   482→      const value = result?.value;
+   483→      return typeof value?.method === 'string' && typeof value.to === 'string'
+   484→        ? { method: value.method, to: value.to }
+   485→        : null;
+   486→    } finally {
+   487→      await send('Runtime.releaseObjectGroup', { objectGroup: 'nod-control' }, found.session);
+   488→    }
+   489→  };
+   490→
+   491→  const signInSelector = async (selector: string) => {
+   492→    const seen = new Set<string>();
+   493→    let found: { backendNodeId: number; session: string } | undefined;
+   494→    for (const session of [...sessions].reverse()) {
+   495→      for (const frame of await tree(session)) {
+   496→        if (seen.has(frame.id)) continue;
+   497→        seen.add(frame.id);
+   498→        const { result, exceptionDetails } = (await send(
+   499→          'Runtime.evaluate',
+   500→          {
+   501→            contextId: await world(session, frame.id),
+   502→            expression: `(() => { const nodes = document.querySelectorAll(${JSON.stringify(selector)}); if (nodes.length > 1) throw new Error('Ambiguous sign-in control'); return nodes[0] ?? null; })()`,
+   503→            objectGroup: 'nod-sign-in',
+   504→          },
+   505→          session,
+   506→        )) as { result?: { objectId?: string }; exceptionDetails?: unknown };
+   507→        if (exceptionDetails || (result?.objectId && found))
+   508→          throw new Error('The sign-in selector must identify one control.');
+   509→        if (result?.objectId) {
+   510→          const { node } = (await send(
+   511→            'DOM.describeNode',
+   512→            { objectId: result.objectId },
+   513→            session,
+   514→          )) as {
+   515→            node: { backendNodeId: number };
+   516→          };
+   517→          found = { backendNodeId: node.backendNodeId, session };
+   518→        }
+   519→        await send('Runtime.releaseObjectGroup', { objectGroup: 'nod-sign-in' }, session);
+   520→      }
+   521→    }
+   522→    return found;
+   523→  };
+   524→
+   525→  const controlsFor = async (found: { backendNodeId: number; session: string }) => {
+   526→    const { backendNodeId, session } = found;
+   527→    const { nodes } = (await send(
+   528→      'Accessibility.getPartialAXTree',
+   529→      { backendNodeId, fetchRelatives: true },
+   530→      session,
+   531→    )) as {
+   532→      nodes: Array<{
+   533→        nodeId: string;
+   534→        parentId?: string;
+   535→        ignored?: boolean;
+   536→        backendDOMNodeId?: number;
+   537→        role?: { value?: unknown };
+   538→        name?: { value?: unknown };
+   539→      }>;
+   540→    };
+   541→    const byId = new Map(nodes.map((node) => [node.nodeId, node]));
+   542→    const controls: Array<{ role: string; name: string }> = [];
+   543→    for (
+   544→      let node = nodes.find((item) => item.backendDOMNodeId === backendNodeId);
+   545→      node && controls.length < 3;
+   546→      node = node.parentId ? byId.get(node.parentId) : undefined
+   547→    ) {
+   548→      const name = String(node.name?.value ?? '').trim();
+   549→      if (!node.ignored && name) controls.push({ role: String(node.role?.value ?? ''), name });
+   550→    }
+   551→    return controls;
+   552→  };
+   553→
+   554→  const controlTarget = async (query: ControlQuery) => {
+   555→    const found = await locate(query);
+   556→    const [frame] = found ? await tree(found.session) : [];
+   557→    return found && frame?.loaderId
+   558→      ? {
+   559→          identity: {
+   560→            frame: frame.id,
+   561→            document: frame.loaderId,
+   562→            backendNodeId: found.backendNodeId,
+   563→          },
+   564→          controls: await controlsFor(found),
+   565→        }
+   566→      : undefined;
+   567→  };
+   568→
+   569→  const resolveControl = async (backendNodeId: number, session: string, frameId: string) => {
+   570→    const { object } = (await send(
+   571→      'DOM.resolveNode',
+   572→      {
+   573→        backendNodeId,
+   574→        executionContextId: await world(session, frameId),
+   575→        objectGroup: 'nod-sign-in',
+   576→      },
+   577→      session,
+   578→    )) as { object: { objectId?: string } };
+   579→    if (!object.objectId) throw new Error('The sign-in control is no longer available.');
+   580→    return object.objectId;
+   581→  };
+   582→
+   583→  const controlSnapshot = async (objectId: string, session: string) => {
+   584→    const { result, exceptionDetails } = (await send(
+   585→      'Runtime.callFunctionOn',
+   586→      {
+   587→        objectId,
+   588→        functionDeclaration: signInSnapshot,
+   589→        returnByValue: true,
+   590→      },
+   591→      session,
+   592→    )) as { result?: { value?: string | null }; exceptionDetails?: unknown };
+   593→    if (exceptionDetails || !result?.value)
+   594→      throw new Error('The sign-in control is no longer available.');
+   595→    return result.value;
+   596→  };
+   597→
+   598→  return {
+   599→    async copySelection(): Promise<string | undefined> {
+   600→      const { browserContextId } = (await send('Target.createBrowserContext', {
+   601→        disposeOnDetach: true,
+   602→      })) as { browserContextId: string };
+   603→      try {
+   604→        const { targetId: trustedTarget } = (await send('Target.createTarget', {
+   605→          url: 'chrome://newtab/',
+   606→          browserContextId,
+   607→          background: true,
+   608→        })) as { targetId: string };
+   609→        const { sessionId: trusted } = (await send('Target.attachToTarget', {
+   610→          targetId: trustedTarget,
+   611→          flatten: true,
+   612→        })) as { sessionId: string };
+   613→        await send('Emulation.setFocusEmulationEnabled', { enabled: true }, trusted);
+   614→        const trustedEvaluate = async (expression: string, cleanup = false) => {
+   615→          const { result, exceptionDetails } = (await send(
+   616→            'Runtime.evaluate',
+   617→            { expression, awaitPromise: true, returnByValue: true },
+   618→            trusted,
+   619→            cleanup,
+   620→          )) as { result?: { value?: unknown }; exceptionDetails?: unknown };
+   621→          if (exceptionDetails) throw new Error('The browser clipboard is unavailable.');
+   622→          return result?.value;
+   623→        };
+   624→        const origin = await trustedEvaluate('location.origin');
+   625→        if (origin !== 'chrome://newtab' && origin !== 'chrome://new-tab-page')
+   626→          throw new Error('The browser clipboard is unavailable.');
+   627→        await send('Browser.grantPermissions', {
+   628→          browserContextId,
+   629→          origin,
+   630→          permissions: ['clipboardReadWrite', 'clipboardSanitizedWrite'],
+   631→        });
+   632→        const modifier =
+   633→          (await trustedEvaluate("navigator.platform.startsWith('Mac')")) === true ? 4 : 2;
+   634→        const prepared = await trustedEvaluate(`(async () => {
+   635→          let previousItems;
+   636→          try {
+   637→            previousItems = await Promise.all((await navigator.clipboard.read()).map(async item => {
+   638→              if (!item.types.every(type => ClipboardItem.supports(type))) throw new Error('Unsupported clipboard data');
+   639→              const entries = await Promise.all(item.types.map(async type => [type, await item.getType(type)]));
+   640→              return new ClipboardItem(Object.fromEntries(entries));
+   641→            }));
+   642→          } catch {}
+   643→          let previousText;
+   644→          try {
+   645→            previousText = await navigator.clipboard.readText();
+   646→          } catch (error) {
+   647→            if (error?.name !== 'NotFoundError') throw error;
+   648→            previousText = '';
+   649→          }
+   650→          const restorable = Boolean(previousItems?.length) &&
+   651→            (!previousText || previousItems.some(item => item.types.includes('text/plain')));
+   652→          if (previousText && !restorable) throw new Error('Clipboard snapshot unavailable');
+   653→          const marker = restorable ? crypto.randomUUID() : null;
+   654→          globalThis.__nodClipboard = { previousText, previousItems, marker };
+   655→          return { mark: Boolean(marker), restorable };
+   656→        })()`);
+   657→        if (
+   658→          !prepared ||
+   659→          typeof prepared !== 'object' ||
+   660→          !('mark' in prepared) ||
+   661→          typeof prepared.mark !== 'boolean' ||
+   662→          !('restorable' in prepared) ||
+   663→          typeof prepared.restorable !== 'boolean'
+   664→        )
+   665→          throw new Error('The browser clipboard is unavailable.');
+   666→        let restore = prepared.restorable;
+   667→        try {
+   668→          if (prepared.mark) {
+   669→            if (
+   670→              (await trustedEvaluate(
+   671→                'navigator.clipboard.writeText(globalThis.__nodClipboard.marker).then(() => true)',
+   672→              )) !== true
+   673→            )
+   674→              throw new Error('The browser clipboard is unavailable.');
+   675→          }
+   676→          const key = {
+   677→            key: 'c',
+   678→            code: 'KeyC',
+   679→            windowsVirtualKeyCode: 67,
+   680→            modifiers: modifier,
+   681→          };
+   682→          try {
+   683→            await send(
+   684→              'Input.dispatchKeyEvent',
+   685→              { ...key, type: 'keyDown', commands: ['copy'] },
+   686→              page,
+   687→            );
+   688→          } finally {
+   689→            await send('Input.dispatchKeyEvent', { ...key, type: 'keyUp' }, page, true);
+   690→          }
+   691→          const outcome = await trustedEvaluate(`(async () => {
+   692→            let text;
+   693→            try {
+   694→              text = await navigator.clipboard.readText();
+   695→            } catch (error) {
+   696→              if (error?.name !== 'NotFoundError') throw error;
+   697→              text = '';
+   698→            }
+   699→            const { previousText, marker } = globalThis.__nodClipboard;
+   700→            if (!text || (marker ? text === marker : text === previousText)) return { status: 'unchanged' };
+   701→            if (text.length > 262144) return { status: 'too_large' };
+   702→            return { status: 'copied', text };
+   703→          })()`);
+   704→          if (!outcome || typeof outcome !== 'object' || !('status' in outcome))
+   705→            throw new Error('The browser clipboard is unavailable.');
+   706→          if (outcome.status === 'too_large') throw new Error('The copied text is too long.');
+   707→          if (outcome.status === 'unchanged') {
+   708→            if (!prepared.mark) restore = false;
+   709→            return undefined;
+   710→          }
+   711→          if (
+   712→            outcome.status !== 'copied' ||
+   713→            !('text' in outcome) ||
+   714→            typeof outcome.text !== 'string'
+   715→          )
+   716→            throw new Error('The browser clipboard is unavailable.');
+   717→          signal?.throwIfAborted();
+   718→          return outcome.text;
+   719→        } finally {
+   720→          if (
+   721→            restore &&
+   722→            (await trustedEvaluate(
+   723→              'navigator.clipboard.write(globalThis.__nodClipboard.previousItems).then(() => true)',
+   724→              true,
+   725→            )) !== true
+   726→          )
+   727→            throw new Error('The browser clipboard could not be restored.');
+   728→        }
+   729→      } finally {
+   730→        await send('Target.disposeBrowserContext', { browserContextId }, undefined, true);
+   731→      }
+   732→    },
+   733→    async readOnly(expression: string) {
+   734→      const { result, exceptionDetails } = (await send(
+   735→        'Runtime.evaluate',
+   736→        {
+   737→          expression,
+   738→          throwOnSideEffect: true,
+   739→          returnByValue: true,
+   740→          awaitPromise: false,
+   741→          timeout: 5000,
+   742→        },
+   743→        page,
+   744→      )) as { result?: { subtype?: string; value?: unknown }; exceptionDetails?: unknown };
+   745→      if (exceptionDetails || result?.subtype === 'promise') return undefined;
+   746→      return { value: result?.value };
+   747→    },
+   748→    async navigation() {
+   749→      const { currentIndex, entries } = (await send('Page.getNavigationHistory', {}, page)) as {
+   750→        currentIndex: number;
+   751→        entries: Array<{ transitionType?: string; url?: string }>;
+   752→      };
+   753→      return { type: entries[currentIndex]?.transitionType, url: entries[currentIndex]?.url };
+   754→    },
+   755→    async scripted(mark = false) {
+   756→      const [main] = await tree(page);
+   757→      if (!main) throw new Error('The browser document is unavailable.');
+   758→      return (
+   759→        (await evaluate(
+   760→          page,
+   761→          await world(page, main.id),
+   762→          mark ? '(globalThis.__nodScripted = true)' : 'Boolean(globalThis.__nodScripted)',
+   763→        )) === true
+   764→      );
+   765→    },
+   766→    async focused(): Promise<FocusedField | undefined> {
+   767→      const hits = (await everyFrame(focusScript, 'focus')).filter((item) => item.value);
+   768→      if (hits.length !== 1) return undefined;
+   769→      const hit = hits[0]!;
+   770→      return { origin: hit.origin, session: hit.session, context: hit.context };
+   771→    },
+   772→    async blur() {
+   773→      await everyFrame(blurScript);
+   774→    },
+   775→    async holding() {
+   776→      return (
+   777→        await everyFrame(
+   778→          `[...(globalThis.__nodPrivateFields ?? [])].some(node => node.isConnected && (node.value || (node.isContentEditable && node.textContent)))`,
+   779→          undefined,
+   780→          true,
+   781→        )
+   782→      ).some((item) => item.value === true);
+   783→    },
+   784→    async mask(on: boolean, secrets: string[] = [], allFields = true, snapshot = false) {
+   785→      await everyFrame(
+   786→        maskScript(on, secrets, allFields, snapshot),
+   787→        on && (allFields || secrets.length) ? 'document' : undefined,
+   788→        true,
+   789→      );
+   790→    },
+   791→    async arm(field: FocusedField, privateValue = true) {
+   792→      return String((await evaluate(field.session, field.context, armScript(privateValue))) ?? '');
+   793→    },
+   794→    async insert(field: FocusedField, text: string) {
+   795→      return (
+   796→        (await evaluate(
+   797→          field.session,
+   798→          field.context,
+   799→          `(() => { const node = ${active}; if (!node || node !== globalThis.__nodField || node.tagName === 'SELECT') return false; for (const character of ${JSON.stringify(text)}) if (!node.isConnected || ${active} !== node || !document.execCommand('insertText', false, character)) return false; return true; })()`,
+   800→        )) === true
+   801→      );
+   802→    },
+   803→    async code(field: FocusedField, selector: string, value: string) {
+   804→      return (
+   805→        (await evaluate(
+   806→          field.session,
+   807→          field.context,
+   808→          `(() => { const active = ${active}; const nodes = ${selector.startsWith('@') ? '[active]' : `Array.from(document.querySelectorAll(${JSON.stringify(selector)}))`}; if (!active || active !== globalThis.__nodFocused || !nodes.includes(active) || !nodes.length || nodes.length > ${value.length}) return false; const values = nodes.length === 1 ? [${JSON.stringify(value)}] : Array.from(${JSON.stringify(value)}); if (nodes.length !== values.length) return false; for (let index = 0; index < nodes.length; index++) { const node = nodes[index]; (globalThis.__nodPrivateFields ??= new Set()).add(node); node.setAttribute('autocomplete', 'off'); node.focus(); if (${active} !== node) return false; if (typeof node.select === 'function') node.select(); else document.execCommand('selectAll'); document.execCommand('delete'); for (const character of values[index]) { if (${active} !== node || !document.execCommand('insertText', false, character)) return false; } } return true; })()`,
+   809→        )) === true
+   810→      );
+   811→    },
+   812→    async choose(field: FocusedField, choices: string[]) {
+   813→      return (
+   814→        (await evaluate(
+   815→          field.session,
+   816→          field.context,
+   817→          `(() => { const node = ${active}; const choices = ${JSON.stringify(choices)}; if (!node || node !== globalThis.__nodField || node.tagName !== 'SELECT') return false; const options = [...node.options]; const option = options.find((item) => choices.includes(item.value) || choices.includes(item.text.trim())) ?? options.find((item) => choices.some(choice => choice.toLocaleLowerCase() === item.value.toLocaleLowerCase() || choice.toLocaleLowerCase() === item.text.trim().toLocaleLowerCase())); if (!option) return false; node.value = option.value; node.dispatchEvent(new Event('input', { bubbles: true })); node.dispatchEvent(new Event('change', { bubbles: true })); return true; })()`,
+   818→        )) === true
+   819→      );
+   820→    },
+   821→    target: controlTarget,
+   822→    async controls(query: ControlQuery) {
+   823→      return (await controlTarget(query))?.controls ?? [];
+   824→    },
+   825→    async signInControl(query: ControlQuery): Promise<BoundSignInControl> {
+   826→      const found = query.selector ? await signInSelector(query.selector) : await locate(query);
+   827→      if (!found) throw new Error('The sign-in control could not be found.');
+   828→      try {
+   829→        const frames = await tree(found.session);
+   830→        let frame: FrameNode['frame'] | undefined;
+   831→        let objectId: string | undefined;
+   832→        for (const candidate of frames) {
+   833→          const resolved = await resolveControl(found.backendNodeId, found.session, candidate.id);
+   834→          const { result } = (await send(
+   835→            'Runtime.callFunctionOn',
+   836→            {
+   837→              objectId: resolved,
+   838→              functionDeclaration: 'function () { return this.ownerDocument === document; }',
+   839→              returnByValue: true,
+   840→            },
+   841→            found.session,
+   842→          )) as { result?: { value?: boolean } };
+   843→          if (result?.value === true) {
+   844→            frame = candidate;
+   845→            objectId = resolved;
+   846→            break;
+   847→          }
+   848→        }
+   849→        if (!frame?.loaderId || !objectId)
+   850→          throw new Error('The sign-in document is no longer available.');
+   851→        const { result, exceptionDetails } = (await send(
+   852→          'Runtime.callFunctionOn',
+   853→          {
+   854→            objectId,
+   855→            functionDeclaration: `function () { return (this.nodeType === 1 ? this : this.parentElement)?.closest(${JSON.stringify(signInControlSelector)}); }`,
+   856→            objectGroup: 'nod-sign-in',
+   857→          },
+   858→          found.session,
+   859→        )) as { result?: { objectId?: string }; exceptionDetails?: unknown };
+   860→        if (exceptionDetails || !result?.objectId)
+   861→          throw new Error('The sign-in control is not available.');
+   862→        const { node } = (await send(
+   863→          'DOM.describeNode',
+   864→          { objectId: result.objectId },
+   865→          found.session,
+   866→        )) as { node: { backendNodeId: number } };
+   867→        const snapshot = await controlSnapshot(result.objectId, found.session);
+   868→        const controls = await controlsFor({
+   869→          backendNodeId: node.backendNodeId,
+   870→          session: found.session,
+   871→        });
+   872→        if (
+   873→          !controls[0]?.name ||
+   874→          !['button', 'link'].includes(controls[0].role) ||
+   875→          (await controlSnapshot(result.objectId, found.session)) !== snapshot
+   876→        )
+   877→          throw new Error('The sign-in control changed during inspection.');
+   878→        const details = JSON.parse(snapshot) as {
+   879→          origin: string;
+   880→          url: string;
+   881→          submits: { method: string; to: string } | null;
+   882→        };
+   883→        return {
+   884→          backendNodeId: node.backendNodeId,
+   885→          frameId: frame.id,
+   886→          targetFrameId: frames[0]!.id,
+   887→          loaderId: frame.loaderId,
+   888→          snapshot,
+   889→          controls,
+   890→          origin: details.origin,
+   891→          url: details.url,
+   892→          submits: details.submits,
+   893→        };
+   894→      } finally {
+   895→        await send('Runtime.releaseObjectGroup', { objectGroup: 'nod-sign-in' }, found.session);
+   896→      }
+   897→    },
+   898→    async selectSignInControl(control: BoundSignInControl) {
+   899→      let session: string | undefined;
+   900→      for (const candidate of sessions) {
+   901→        const frames = await tree(candidate);
+   902→        if (
+   903→          frames[0]?.id === control.targetFrameId &&
+   904→          frames.some(
+   905→            (frame) => frame.id === control.frameId && frame.loaderId === control.loaderId,
+   906→          )
+   907→        ) {
+   908→          session = candidate;
+   909→          break;
+   910→        }
+   911→      }
+   912→      if (!session) throw new Error('The sign-in document changed.');
+   913→      const name = `nodSignIn${crypto.randomUUID().replaceAll('-', '')}`;
+   914→      let pressed = false;
+   915→      let outcome: boolean | undefined;
+   916→      let timer: ReturnType<typeof setTimeout> | undefined;
+   917→      let context: number | undefined;
+   918→      try {
+   919→        const objectId = await resolveControl(control.backendNodeId, session, control.frameId);
+   920→        context = await world(session, control.frameId);
+   921→        await send('DOM.scrollIntoViewIfNeeded', { backendNodeId: control.backendNodeId }, session);
+   922→        const { quads } = (await send(
+   923→          'DOM.getContentQuads',
+   924→          { backendNodeId: control.backendNodeId },
+   925→          session,
+   926→        )) as { quads: number[][] };
+   927→        const quad = quads.find((value) => value.length === 8 && value.every(Number.isFinite));
+   928→        if (!quad) throw new Error('The sign-in control is no longer visible.');
+   929→        const point = {
+   930→          x: (quad[0]! + quad[2]! + quad[4]! + quad[6]!) / 4,
+   931→          y: (quad[1]! + quad[3]! + quad[5]! + quad[7]!) / 4,
+   932→        };
+   933→        if (session !== page) {
+   934→          const { backendNodeId } = (await send(
+   935→            'DOM.getFrameOwner',
+   936→            { frameId: control.targetFrameId },
+   937→            page,
+   938→          )) as { backendNodeId: number };
+   939→          const { model } = (await send('DOM.getBoxModel', { backendNodeId }, page)) as {
+   940→            model: { content: number[]; border: number[]; width: number; height: number };
+   941→          };
+   942→          const content = model.content;
+   943→          if (
+   944→            content[1] !== content[3] ||
+   945→            content[0] !== content[6] ||
+   946→            content[2] !== content[4] ||
+   947→            content[5] !== content[7] ||
+   948→            model.border[2]! - model.border[0]! !== model.width ||
+   949→            model.border[5]! - model.border[1]! !== model.height
+   950→          )
+   951→            throw new Error('The sign-in frame could not be located safely.');
+   952→          point.x += content[0]!;
+   953→          point.y += content[1]!;
+   954→        }
+   955→        const check = async () => {
+   956→          if (
+   957→            (await controlSnapshot(objectId, session!)) !== control.snapshot ||
+   958→            JSON.stringify(
+   959→              await controlsFor({ backendNodeId: control.backendNodeId, session: session! }),
+   960→            ) !== JSON.stringify(control.controls)
+   961→          )
+   962→            throw new Error('The sign-in control changed.');
+   963→          const hit = await locate({ pixel: point }, true);
+   964→          if (!hit || hit.session !== session) throw new Error('The sign-in control is covered.');
+   965→          const hitId = await resolveControl(hit.backendNodeId, session!, control.frameId);
+   966→          const { result, exceptionDetails } = (await send(
+   967→            'Runtime.callFunctionOn',
+   968→            {
+   969→              objectId,
+   970→              functionDeclaration: 'function (hit) { return this === hit || this.contains(hit); }',
+   971→              arguments: [{ objectId: hitId }],
+   972→              returnByValue: true,
+   973→            },
+   974→            session,
+   975→          )) as { result?: { value?: boolean }; exceptionDetails?: unknown };
+   976→          if (exceptionDetails || result?.value !== true)
+   977→            throw new Error('The sign-in control is covered.');
+   978→        };
+   979→        await check();
+   980→        await send('Input.dispatchMouseEvent', { type: 'mouseMoved', ...point }, page);
+   981→        await check();
+   982→        await send('Runtime.enable', {}, session);
+   983→        await send('Runtime.addBinding', { name, executionContextId: context }, session);
+   984→        const clicked = new Promise<boolean>((resolve) => {
+   985→          bindings.set(name, (payload) => {
+   986→            outcome = payload === 'accepted';
+   987→            resolve(outcome);
+   988→          });
+   989→          timer = setTimeout(() => resolve(false), 5000);
+   990→        });
+   991→        await send(
+   992→          'Runtime.callFunctionOn',
+   993→          {
+   994→            objectId,
+   995→            functionDeclaration: `function (name, expected) {
+   996→            const node = this;
+   997→            const guard = event => {
+   998→              const valid = event.isTrusted && event.composedPath().includes(node) && (${signInSnapshot}).call(node) === expected;
+   999→              if (!valid) { event.preventDefault(); event.stopImmediatePropagation(); }
+  1000→              if (!valid || event.type === 'click') globalThis[name](valid ? 'accepted' : 'changed');
+  1001→            };
+  1002→            globalThis[name + 'Guard'] = guard;
+  1003→            for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) window.addEventListener(type, guard, true);
+  1004→          }`,
+  1005→            arguments: [{ value: name }, { value: control.snapshot }],
+  1006→          },
+  1007→          session,
+  1008→        );
+  1009→        pressed = true;
+  1010→        await send(
+  1011→          'Input.dispatchMouseEvent',
+  1012→          { type: 'mousePressed', ...point, button: 'left', buttons: 1, clickCount: 1 },
+  1013→          page,
+  1014→        );
+  1015→        if (outcome === false) throw new Error('The sign-in control changed.');
+  1016→        await check();
+  1017→        await send(
+  1018→          'Input.dispatchMouseEvent',
+  1019→          { type: 'mouseReleased', ...point, button: 'left', buttons: 0, clickCount: 1 },
+  1020→          page,
+  1021→        );
+  1022→        pressed = false;
+  1023→        if (!(await clicked)) throw new Error('The sign-in control did not receive the click.');
+  1024→      } finally {
+  1025→        if (pressed)
+  1026→          await send(
+  1027→            'Input.dispatchMouseEvent',
+  1028→            { type: 'mouseReleased', x: -1, y: -1, button: 'left', buttons: 0 },
+  1029→            page,
+  1030→            true,
+  1031→          ).catch(() => {});
+  1032→        clearTimeout(timer);
+  1033→        bindings.delete(name);
+  1034→        if (context !== undefined)
+  1035→          await send(
+  1036→            'Runtime.evaluate',
+  1037→            {
+  1038→              contextId: context,
+  1039→              expression: `(() => { const name = ${JSON.stringify(name)}; const guard = globalThis[name + 'Guard']; for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) window.removeEventListener(type, guard, true); delete globalThis[name + 'Guard']; })()`,
+  1040→            },
+  1041→            session,
+  1042→            true,
+  1043→          ).catch(() => {});
+  1044→        await send('Runtime.removeBinding', { name }, session, true).catch(() => {});
+  1045→        await send(
+  1046→          'Runtime.releaseObjectGroup',
+  1047→          { objectGroup: 'nod-sign-in' },
+  1048→          session,
+  1049→          true,
+  1050→        ).catch(() => {});
+  1051→      }
+  1052→    },
+  1053→    async submits(query: ControlQuery, enter: boolean) {
+  1054→      const target = await locate(query);
+  1055→      if (target) return formOf(target, enter);
+  1056→      if (query.focused) return null;
+  1057→      throw new Error('The control could not be found.');
+  1058→    },
+  1059→    async document() {
+  1060→      const [main] = await tree(page);
+  1061→      if (!main?.loaderId) throw new Error('The checkout page could not be identified.');
+  1062→      return main.loaderId;
+  1063→    },
+  1064→    async alive(loaderId: string) {
+  1065→      const { targetInfos } = (await send('Target.getTargets')) as {
+  1066→        targetInfos: Array<{ targetId: string; type: string }>;
+  1067→      };
+  1068→      for (const target of targetInfos.filter((item) => item.type === 'page')) {
+  1069→        const { sessionId } = (await send('Target.attachToTarget', {
+  1070→          targetId: target.targetId,
+  1071→          flatten: true,
+  1072→        })) as { sessionId: string };
+  1073→        const [main] = await tree(sessionId);
+  1074→        if (main?.loaderId === loaderId) return true;
+  1075→      }
+  1076→      return false;
+  1077→    },
+  1078→    close() {
+  1079→      socket.close();
+  1080→    },
+  1081→  };
+  1082→}
+  1083→

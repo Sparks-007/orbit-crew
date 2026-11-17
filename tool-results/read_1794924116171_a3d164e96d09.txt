@@ -1,0 +1,966 @@
+     1→import { createBrowserWorkerFixture as harness } from './browser-fixture.ts';
+     2→import { existingDaemonCommand } from '../src/providers/agent-browser/screens.ts';
+     3→import { openDevtools } from '../src/providers/agent-browser/devtools.ts';
+     4→import { createServer as createHttpServer } from 'node:http';
+     5→import { mkdtemp, rm } from 'node:fs/promises';
+     6→import { tmpdir } from 'node:os';
+     7→import { join } from 'node:path';
+     8→import { setTimeout as delay } from 'node:timers/promises';
+     9→import { BrowserActionError, type BrowserAction } from '../src/ports/computer.ts';
+    10→import { createAgentBrowserComputer } from '../src/providers/agent-browser/index.ts';
+    11→import assert from 'node:assert/strict';
+    12→import { randomUUID } from 'node:crypto';
+    13→import test from 'node:test';
+    14→import pg from 'pg';
+    15→import type { BrowserConnectionRequest } from '../src/ports/agent.ts';
+    16→import type { Computer } from '../src/ports/computer.ts';
+    17→import { createBrowserConnections } from '../src/server/browser-connections.ts';
+    18→import { createAnalytics } from '../src/server/analytics.ts';
+    19→import type { ProductAnalytics } from '../src/ports/analytics.ts';
+    20→
+    21→test(
+    22→  'browser profiles require an explicit observed sign-in outcome and retain owner and turn fences',
+    23→  { skip: !process.env.TEST_DATABASE_URL },
+    24→  async () => {
+    25→    const schema = `browser_connections_${randomUUID().replaceAll('-', '')}`;
+    26→    const admin = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL });
+    27→    await admin.query(`CREATE SCHEMA ${schema}`);
+    28→    const pool = new pg.Pool({
+    29→      connectionString: process.env.TEST_DATABASE_URL,
+    30→      options: `-c search_path=${schema}`,
+    31→    });
+    32→    let location = 'https://example.test/login';
+    33→    const page = (path = '/account') => {
+    34→      location = `https://example.test${path}`;
+    35→    };
+    36→    try {
+    37→      await pool.query(
+    38→        'CREATE TABLE threads (id uuid PRIMARY KEY,owner_id text,status text,archived_at timestamptz)',
+    39→      );
+    40→      await pool.query(
+    41→        'CREATE TABLE turns (id uuid PRIMARY KEY,owner_id text,thread_id uuid,status text,background boolean NOT NULL DEFAULT false,created_at timestamptz NOT NULL DEFAULT clock_timestamp(),session_id uuid GENERATED ALWAYS AS (CASE WHEN background THEN id ELSE thread_id END) STORED)',
+    42→      );
+    43→      const first = { threadId: randomUUID(), turnId: randomUUID() };
+    44→      const second = { threadId: randomUUID(), turnId: randomUUID() };
+    45→      for (const turn of [first, second]) {
+    46→        await pool.query("INSERT INTO threads(id,owner_id,status) VALUES($1,'owner-a','running')", [
+    47→          turn.threadId,
+    48→        ]);
+    49→        await pool.query(
+    50→          "INSERT INTO turns(id,owner_id,thread_id,status) VALUES($1,'owner-a',$2,'running')",
+    51→          [turn.turnId, turn.threadId],
+    52→        );
+    53→      }
+    54→      let cancelTurnId: string | undefined;
+    55→      let changeOrigin = false;
+    56→      let held = false;
+    57→      let retainedHold = false;
+    58→      const bindings: string[] = [];
+    59→      const removed: string[] = [];
+    60→      const computer = {
+    61→        async bindProfile(_threadId: string, profileId: string) {
+    62→          if (held) throw Object.assign(new Error('Synthetic held profile'), { statusCode: 423 });
+    63→          bindings.push(profileId);
+    64→        },
+    65→        async act() {
+    66→          return { url: location, text: 'Synthetic page with a password field' };
+    67→        },
+    68→        async currentPage() {
+    69→          if (cancelTurnId)
+    70→            await pool.query("UPDATE turns SET status='cancelled' WHERE id=$1", [cancelTurnId]);
+    71→          if (changeOrigin) location = 'https://other.test/account';
+    72→          return { origin: new URL(location).origin, url: location };
+    73→        },
+    74→        async hold(_id: string, value: boolean) {
+    75→          retainedHold = value;
+    76→        },
+    77→        async close() {},
+    78→        async deleteProfile(profileId: string) {
+    79→          if (retainedHold)
+    80→            throw Object.assign(new Error('Synthetic retained browser hold'), { statusCode: 423 });
+    81→          removed.push(profileId);
+    82→        },
+    83→      } as unknown as Computer;
+    84→      const service = await createBrowserConnections(pool, { ownerId: 'owner-a', computer });
+    85→      const opened = await service.request(
+    86→        { action: 'connect', url: 'https://example.test/login' },
+    87→        first,
+    88→      );
+    89→      assert.equal(opened.status, 'profile_opened');
+    90→      assert.ok('connectionId' in opened);
+    91→      const connectionId = opened.connectionId;
+    92→      assert.deepEqual(
+    93→        await service.target({ action: 'use', url: 'https://example.test/login', connectionId }),
+    94→        {
+    95→          origin: 'https://example.test',
+    96→          account: 'example.test',
+    97→          kind: 'session',
+    98→          itemId: connectionId,
+    99→        },
+   100→      );
+   101→      assert.equal(
+   102→        (
+   103→          await service.request(
+   104→            { action: 'use', url: 'https://example.test/login', connectionId },
+   105→            first,
+   106→          )
+   107→        ).status,
+   108→        'session_opened',
+   109→      );
+   110→      assert.equal((await service.list())[0].browserState, 'pending');
+   111→      const save = {
+   112→        action: 'save' as const,
+   113→        url: 'https://example.test/login',
+   114→        connectionId,
+   115→        signedIn: true as const,
+   116→      };
+   117→      for (const state of ['pending', 'needs_sign_in']) {
+   118→        page();
+   119→        await pool.query('UPDATE browser_connections SET state=$2,checked_at=NULL WHERE id=$1', [
+   120→          connectionId,
+   121→          state,
+   122→        ]);
+   123→        const opened = await service.request(
+   124→          { action: 'use', url: 'https://example.test/account', connectionId },
+   125→          first,
+   126→        );
+   127→        assert.equal(opened.status, 'session_opened');
+   128→        for (const signedIn of [undefined, false]) {
+   129→          const unconfirmed = {
+   130→            action: 'save',
+   131→            url: 'https://example.test/account',
+   132→            connectionId,
+   133→            ...(signedIn === undefined ? {} : { signedIn }),
+   134→          } as BrowserConnectionRequest;
+   135→          assert.equal((await service.request(unconfirmed, first)).status, 'rejected');
+   136→        }
+   137→        const stored = (await service.list())[0];
+   138→        assert.equal(stored.browserState, state);
+   139→        assert.equal(stored.status, 'disconnected');
+   140→        assert.equal(stored.checkedAt, undefined);
+   141→      }
+   142→      page('/login');
+   143→      changeOrigin = true;
+   144→      assert.equal((await service.request(save, first)).status, 'needs_sign_in');
+   145→      assert.equal((await service.list())[0].browserState, 'needs_sign_in');
+   146→      changeOrigin = false;
+   147→      page('/login');
+   148→      cancelTurnId = first.turnId;
+   149→      await assert.rejects(service.request(save, first), /no longer active|unavailable/);
+   150→      assert.equal((await service.list())[0].browserState, 'needs_sign_in');
+   151→      await pool.query("UPDATE turns SET status='running' WHERE id=$1", [first.turnId]);
+   152→      cancelTurnId = undefined;
+   153→      assert.equal((await service.request(save, first)).status, 'session_saved');
+   154→      assert.equal((await service.list())[0].browserState, 'saved');
+   155→      await pool.query(
+   156→        "UPDATE browser_connections SET checked_at='2001-01-01T00:00:00Z' WHERE id=$1",
+   157→        [connectionId],
+   158→      );
+   159→      const checkedAt = (await service.list())[0].checkedAt;
+   160→      assert.deepEqual(
+   161→        await service.request(
+   162→          { action: 'use', url: 'https://example.test/account', connectionId },
+   163→          second,
+   164→        ),
+   165→        { status: 'rejected', code: 'browser_connection_unavailable' },
+   166→      );
+   167→      await pool.query("UPDATE turns SET status='succeeded' WHERE id=$1", [first.turnId]);
+   168→      const priorBindings = bindings.length;
+   169→      cancelTurnId = second.turnId;
+   170→      await assert.rejects(
+   171→        service.request(
+   172→          { action: 'use', url: 'https://example.test/account', connectionId },
+   173→          second,
+   174→        ),
+   175→        /no longer active/,
+   176→      );
+   177→      assert.equal((await service.list())[0].browserState, 'saved');
+   178→      assert.equal((await service.list())[0].checkedAt, checkedAt);
+   179→      await pool.query("UPDATE turns SET status='running' WHERE id=$1", [second.turnId]);
+   180→      cancelTurnId = undefined;
+   181→      page();
+   182→      held = true;
+   183→      assert.deepEqual(
+   184→        await service.request(
+   185→          { action: 'use', url: 'https://example.test/account', connectionId },
+   186→          second,
+   187→        ),
+   188→        { status: 'rejected', code: 'browser_connection_busy' },
+   189→      );
+   190→      held = false;
+   191→      assert.equal(
+   192→        (
+   193→          await service.request(
+   194→            { action: 'use', url: 'https://example.test/account', connectionId },
+   195→            second,
+   196→          )
+   197→        ).status,
+   198→        'session_opened',
+   199→      );
+   200→      assert.equal((await service.list())[0].browserState, 'saved');
+   201→      assert.equal((await service.list())[0].checkedAt, checkedAt);
+   202→      assert.equal(bindings.length, priorBindings + 2);
+   203→      assert.equal(new Set(bindings).size, 1);
+   204→      page();
+   205→      assert.equal((await service.request(save, second)).status, 'session_saved');
+   206→      const recheckedAt = (await service.list())[0].checkedAt;
+   207→      assert.notEqual(recheckedAt, checkedAt);
+   208→      changeOrigin = true;
+   209→      assert.equal(
+   210→        (
+   211→          await service.request(
+   212→            { action: 'use', url: 'https://example.test/account', connectionId },
+   213→            second,
+   214→          )
+   215→        ).status,
+   216→        'needs_sign_in',
+   217→      );
+   218→      assert.equal((await service.list())[0].browserState, 'needs_sign_in');
+   219→      assert.equal((await service.list())[0].checkedAt, recheckedAt);
+   220→      changeOrigin = false;
+   221→      location = 'https://other.test/';
+   222→      assert.equal(
+   223→        (await service.request({ action: 'use', url: 'https://other.test/', connectionId }, second))
+   224→          .status,
+   225→        'session_opened',
+   226→      );
+   227→      assert.equal((await service.list())[0].browserState, 'needs_sign_in');
+   228→      assert.equal(
+   229→        (await service.request({ ...save, url: 'https://other.test/' }, second)).status,
+   230→        'rejected',
+   231→      );
+   232→      page();
+   233→      const other = await createBrowserConnections(pool, { ownerId: 'owner-b', computer });
+   234→      const foreign = { threadId: randomUUID(), turnId: randomUUID() };
+   235→      await pool.query("INSERT INTO threads(id,owner_id,status) VALUES($1,'owner-b','running')", [
+   236→        foreign.threadId,
+   237→      ]);
+   238→      await pool.query(
+   239→        "INSERT INTO turns(id,owner_id,thread_id,status) VALUES($1,'owner-b',$2,'running')",
+   240→        [foreign.turnId, foreign.threadId],
+   241→      );
+   242→      await assert.rejects(
+   243→        other.request({ action: 'use', url: 'https://example.test/', connectionId }, foreign),
+   244→        /unavailable/,
+   245→      );
+   246→      assert.deepEqual(
+   247→        await service.target({ action: 'use', url: 'https://other.test/deep', connectionId }),
+   248→        {
+   249→          origin: 'https://other.test',
+   250→          account: (await service.sessions())[0]!.label,
+   251→          kind: 'session',
+   252→          itemId: connectionId,
+   253→          sessionOrigin: 'https://example.test',
+   254→        },
+   255→      );
+   256→      assert.equal(
+   257→        await service.target({ action: 'connect', url: 'https://new.test/a' }),
+   258→        undefined,
+   259→      );
+   260→      assert.equal(await service.target(save), undefined);
+   261→      assert.equal(
+   262→        await other.target({ action: 'use', url: 'https://example.test/', connectionId }),
+   263→        undefined,
+   264→      );
+   265→      assert.deepEqual(
+   266→        (await service.sessions()).map((session) => [session.kind, session.origin]),
+   267→        [['session', 'https://example.test']],
+   268→      );
+   269→      assert.deepEqual(await other.sessions(), []);
+   270→      await pool.query(
+   271→        "UPDATE browser_connections SET start_url='https://example.test/login?token=synthetic-private#code' WHERE id=$1",
+   272→        [connectionId],
+   273→      );
+   274→      assert.equal((await service.sessions())[0]!.url, 'https://example.test/login');
+   275→      await computer.hold(second.threadId, true);
+   276→      for (const status of ['queued', 'running', 'waiting']) {
+   277→        await pool.query('UPDATE turns SET status=$2 WHERE id=$1', [second.turnId, status]);
+   278→        await assert.rejects(service.disconnect(connectionId), /Stop the active work/);
+   279→        assert.equal(retainedHold, true);
+   280→        assert.equal(removed.length, 0);
+   281→      }
+   282→      await pool.query("UPDATE turns SET status='completed' WHERE id=$1", [second.turnId]);
+   283→      await assert.rejects(
+   284→        service.request({ action: 'use', url: 'https://example.test/', connectionId }, second),
+   285→        /no longer active/,
+   286→      );
+   287→      await service.disconnect(connectionId);
+   288→      assert.deepEqual(removed, [bindings[0]]);
+   289→      await pool.query(
+   290→        "INSERT INTO browser_connections(id,owner_id,origin,start_url,label,profile_id,state) VALUES($1,'owner-a','https://example.test','https://example.test','Synthetic', $2,'disconnecting')",
+   291→        [connectionId, randomUUID()],
+   292→      );
+   293→      assert.equal(
+   294→        await service.target({ action: 'use', url: 'https://example.test/', connectionId }),
+   295→        undefined,
+   296→      );
+   297→    } finally {
+   298→      await pool.end();
+   299→      await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+   300→      await admin.end();
+   301→    }
+   302→  },
+   303→);
+   304→
+   305→test(
+   306→  'saved browser analytics exclude private browsing details and stay off after consent changes mid-use',
+   307→  { skip: !process.env.TEST_DATABASE_URL },
+   308→  async () => {
+   309→    const schema = `browser_analytics_${randomUUID().replaceAll('-', '')}`;
+   310→    const admin = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL });
+   311→    await admin.query(`CREATE SCHEMA ${schema}`);
+   312→    const pool = new pg.Pool({
+   313→      connectionString: process.env.TEST_DATABASE_URL,
+   314→      options: `-c search_path=${schema}`,
+   315→    });
+   316→    const events: Parameters<ProductAnalytics['capture']>[0][] = [];
+   317→    const analytics = await createAnalytics({
+   318→      environment: 'development',
+   319→      dataRoot: '',
+   320→      installationId: randomUUID(),
+   321→      provider: { capture: (event) => events.push(event), shutdown: async () => {} },
+   322→    });
+   323→    try {
+   324→      const ownerId = 'synthetic-browser-owner';
+   325→      const turn = { threadId: randomUUID(), turnId: randomUUID() };
+   326→      await pool.query(
+   327→        'CREATE TABLE threads(id uuid PRIMARY KEY,owner_id text,archived_at timestamptz)',
+   328→      );
+   329→      await pool.query(
+   330→        'CREATE TABLE turns(id uuid PRIMARY KEY,thread_id uuid,owner_id text,status text)',
+   331→      );
+   332→      await pool.query('INSERT INTO threads VALUES($1,$2,NULL)', [turn.threadId, ownerId]);
+   333→      await pool.query("INSERT INTO turns VALUES($1,$2,$3,'running')", [
+   334→        turn.turnId,
+   335→        turn.threadId,
+   336→        ownerId,
+   337→      ]);
+   338→      let location = 'https://tenant.example.com/account';
+   339→      let waiting: Promise<void> | undefined;
+   340→      let entered = () => {};
+   341→      const computer = {
+   342→        bindProfile: async () => {},
+   343→        hold: async () => {},
+   344→        close: async () => {},
+   345→        deleteProfile: async () => {},
+   346→        act: async () => {
+   347→          entered();
+   348→          await waiting;
+   349→          return { url: location, text: 'Synthetic private account page' };
+   350→        },
+   351→        currentPage: async () => ({ origin: new URL(location).origin, url: location }),
+   352→      } as unknown as Computer;
+   353→      analytics.setUsageData(ownerId, true, randomUUID());
+   354→      const service = await createBrowserConnections(pool, {
+   355→        ownerId,
+   356→        computer,
+   357→        analytics: analytics.forOwner(ownerId),
+   358→        analyticsConsent: () => analytics.consent(ownerId),
+   359→      });
+   360→      const opened = await service.request(
+   361→        {
+   362→          action: 'connect',
+   363→          url: 'https://tenant.example.com/login?secret=synthetic-private',
+   364→          label: 'Private fixture account',
+   365→        },
+   366→        turn,
+   367→      );
+   368→      assert.ok('connectionId' in opened && opened.connectionId);
+   369→      const id = opened.connectionId;
+   370→      const use = () => service.request({ action: 'use', url: location, connectionId: id }, turn);
+   371→      await use();
+   372→      assert.equal(events.filter((event) => event.event === 'service_used').length, 0);
+   373→      await service.request(
+   374→        { action: 'save', url: location, connectionId: id, signedIn: true },
+   375→        turn,
+   376→      );
+   377→      await use();
+   378→      const count = events.length;
+   379→      location = 'https://other.example.org/private-path?secret=synthetic-private';
+   380→      await use();
+   381→      assert.equal(events.length, count);
+   382→      location = 'https://tenant.example.com/account';
+   383→      let release = () => {};
+   384→      const started = new Promise<void>((resolve) => {
+   385→        entered = resolve;
+   386→      });
+   387→      waiting = new Promise<void>((resolve) => {
+   388→        release = resolve;
+   389→      });
+   390→      const inFlight = use();
+   391→      await started;
+   392→      analytics.setUsageData(ownerId, false, randomUUID());
+   393→      analytics.setUsageData(ownerId, true, randomUUID());
+   394→      release();
+   395→      await inFlight;
+   396→      assert.equal(events.length, count);
+   397→      waiting = undefined;
+   398→      analytics.setUsageData(ownerId, false, randomUUID());
+   399→      await use();
+   400→      assert.equal(events.length, count);
+   401→      analytics.setUsageData(ownerId, true, randomUUID());
+   402→      await use();
+   403→      assert.equal(events.length, count + 1);
+   404→      const serialized = JSON.stringify(events);
+   405→      for (const value of [
+   406→        'tenant.',
+   407→        'private-path',
+   408→        'synthetic-private',
+   409→        'Private fixture account',
+   410→        id,
+   411→      ])
+   412→        assert.ok(!serialized.includes(value));
+   413→    } finally {
+   414→      await analytics.shutdown();
+   415→      await pool.end();
+   416→      await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+   417→      await admin.end();
+   418→    }
+   419→  },
+   420→);
+   421→
+   422→function deferred<T = void>() {
+   423→  let resolve!: (value: T) => void;
+   424→  const promise = new Promise<T>((done) => {
+   425→    resolve = done;
+   426→  });
+   427→  return { promise, resolve };
+   428→}
+   429→
+   430→test(
+   431→  'reloading a page reached by a form POST does not resubmit it',
+   432→  { timeout: 60_000 },
+   433→  async () => {
+   434→    let posts = 0;
+   435→    const server = createHttpServer((request, response) => {
+   436→      response.setHeader('content-type', 'text/html');
+   437→      if (request.method === 'POST') {
+   438→        posts += 1;
+   439→        response.end(`<title>Done</title><p>count ${posts}</p>`);
+   440→        return;
+   441→      }
+   442→      response.end('<form method="post" action="/submit"><button id="go">Go</button></form>');
+   443→    });
+   444→    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+   445→    const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+   446→    const directory = await mkdtemp(join(tmpdir(), 'nod-reload-'));
+   447→    const computer = createAgentBrowserComputer({
+   448→      dataRoot: directory,
+   449→      browserExecutable: process.env.NOD_TEST_BROWSER_EXECUTABLE,
+   450→      privateNetwork: true,
+   451→      headless: true,
+   452→    });
+   453→    try {
+   454→      await computer.act('post', { action: 'open', url: origin });
+   455→      await computer.act('post', { action: 'click', selector: '#go' });
+   456→      await computer.act('post', { action: 'wait', text: 'count 1' });
+   457→      assert.equal(posts, 1);
+   458→      await computer.act('post', { action: 'reload' });
+   459→      await computer.act('post', { action: 'wait', load: 'load' });
+   460→      assert.equal(posts, 1);
+   461→      await computer.act('post', { action: 'open', url: origin });
+   462→      await computer.act('post', { action: 'reload' });
+   463→      assert.equal(posts, 1);
+   464→    } finally {
+   465→      await computer.dispose();
+   466→      server.closeAllConnections();
+   467→      await new Promise<void>((resolve) => server.close(() => resolve()));
+   468→      await rm(directory, { recursive: true, force: true });
+   469→    }
+   470→  },
+   471→);
+   472→
+   473→test(
+   474→  'private submission keeps SPA state, delayed requests and field formats, and pauses scripts while a value stays',
+   475→  { timeout: 60_000 },
+   476→  async () => {
+   477→    const submitted = deferred<string>();
+   478→    const cardSubmitted = deferred<string>();
+   479→    let submissions = 0;
+   480→    const server = createHttpServer(async (request, response) => {
+   481→      response.setHeader('content-type', 'text/html');
+   482→      if (request.url === '/record') {
+   483→        let body = '';
+   484→        for await (const bytes of request) body += bytes;
+   485→        submissions++;
+   486→        submitted.resolve(body);
+   487→        response.end('Accepted');
+   488→      } else if (request.url === '/card-record') {
+   489→        let body = '';
+   490→        for await (const bytes of request) body += bytes;
+   491→        cardSubmitted.resolve(body);
+   492→        response.end('Accepted');
+   493→      } else if (request.url === '/delayed') {
+   494→        response.end(`<input id="company"><input id="password" type="password"><button id="submit">Continue</button><script>
+   495→        document.querySelector('button').onclick = () => setTimeout(() => fetch('/record', { method: 'POST', body: JSON.stringify({company: document.querySelector('#company').value, password: document.querySelector('#password').value}) }), 1200);
+   496→      </script>`);
+   497→      } else if (request.url === '/card') {
+   498→        response.end(
+   499→          '<h2>Order total EUR 30</h2><input id="number"><select id="month"><option value="">Choose month</option><option value="aug">August</option></select><input id="year"><input id="expiry"><button id="submit">Pay</button><script>document.querySelector("button").onclick = () => fetch("/card-record", {method:"POST", body:JSON.stringify({month:document.querySelector("#month").value, year:document.querySelector("#year").value, expiry:document.querySelector("#expiry").value})});</script>',
+   500→        );
+   501→      } else {
+   502→        response.end(`<input id="username"><button id="submit">Continue</button><script>
+   503→        document.querySelector('button').onclick = () => { document.body.innerHTML = '<h1>Password step</h1><input type="password" id="password">'; };
+   504→      </script>`);
+   505→      }
+   506→    });
+   507→    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+   508→    const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+   509→    const directory = await mkdtemp(join(tmpdir(), 'nod-private-state-'));
+   510→    const computer = createAgentBrowserComputer({
+   511→      dataRoot: directory,
+   512→      browserExecutable: process.env.NOD_TEST_BROWSER_EXECUTABLE,
+   513→      privateNetwork: true,
+   514→      headless: true,
+   515→    });
+   516→    try {
+   517→      await computer.act('state', { action: 'open', url: origin });
+   518→      await computer.injectCredentials({
+   519→        threadId: 'state',
+   520→        origin,
+   521→        kind: 'identifier',
+   522→        username: 'synthetic@example.test',
+   523→        usernameSelector: '#username',
+   524→        submitSelector: '#submit',
+   525→      });
+   526→      assert.match((await computer.act('state', { action: 'snapshot' })).text, /Password step/);
+   527→      await computer.act('state', { action: 'open', url: `${origin}/delayed` });
+   528→      await computer.act('state', {
+   529→        action: 'fill',
+   530→        selector: '#company',
+   531→        text: 'Synthetic company',
+   532→      });
+   533→      await computer.act('state', { action: 'evaluate', script: 'document.title' });
+   534→      await computer.injectCredentials({
+   535→        threadId: 'state',
+   536→        origin,
+   537→        kind: 'password',
+   538→        password: 'Synthetic private value',
+   539→        passwordSelector: '#password',
+   540→        submitSelector: '#submit',
+   541→      });
+   542→      assert.deepEqual(JSON.parse(await submitted.promise), {
+   543→        company: 'Synthetic company',
+   544→        password: 'Synthetic private value',
+   545→      });
+   546→      assert.equal(submissions, 1);
+   547→      assert.equal(
+   548→        (await computer.act('state', { action: 'snapshot' })).text.includes(
+   549→          'Synthetic private value',
+   550→        ),
+   551→        false,
+   552→      );
+   553→      await assert.rejects(
+   554→        computer.act('state', {
+   555→          action: 'evaluate',
+   556→          script: 'Promise.resolve(document.querySelector("#password").value.length)',
+   557→        }),
+   558→        /scripts are paused/,
+   559→      );
+   560→      await computer.act('state', { action: 'open', url: `${origin}/card` });
+   561→      const fields = {
+   562→        number: '#number',
+   563→        expiryMonth: '#month',
+   564→        expiryYear: { selector: '#year', format: 'YY' },
+   565→        expiry: { selector: '#expiry', format: 'YYYY-MM' },
+   566→      };
+   567→      const bound = await computer.cardDestinations('state', fields);
+   568→      await computer.fillCard({
+   569→        threadId: 'state',
+   570→        ...bound,
+   571→        fields,
+   572→        submitSelector: '#submit',
+   573→        card: {
+   574→          cardNumber: '4242424242424242',
+   575→          expiryMonth: 8,
+   576→          expiryYear: 2030,
+   577→          cardholder: 'Synthetic owner',
+   578→        },
+   579→      });
+   580→      assert.deepEqual(JSON.parse(await cardSubmitted.promise), {
+   581→        month: 'aug',
+   582→        year: '30',
+   583→        expiry: '2030-08',
+   584→      });
+   585→      assert.match(
+   586→        (await computer.act('state', { action: 'snapshot' })).text,
+   587→        /Order total EUR 30/,
+   588→      );
+   589→      await assert.rejects(
+   590→        computer.act('state', {
+   591→          action: 'evaluate',
+   592→          script: 'document.querySelector("#number").value',
+   593→        }),
+   594→        /scripts are paused/,
+   595→      );
+   596→      await computer.act('fence', { action: 'open', url: `${origin}/card` });
+   597→      await computer.act('fence', {
+   598→        action: 'evaluate',
+   599→        script: 'globalThis.__nodScripted = false',
+   600→      });
+   601→      const recovered = createAgentBrowserComputer({
+   602→        dataRoot: directory,
+   603→        browserExecutable: process.env.NOD_TEST_BROWSER_EXECUTABLE,
+   604→        privateNetwork: true,
+   605→        headless: true,
+   606→      });
+   607→      try {
+   608→        assert.equal((await recovered.currentPage('fence')).origin, origin);
+   609→        await recovered.act('fence', { action: 'snapshot' });
+   610→        await assert.rejects(
+   611→          recovered.cardDestinations('fence', fields),
+   612→          /script ran on this document/,
+   613→        );
+   614→        await computer.act('fence', { action: 'reload' });
+   615→        assert.equal(
+   616→          (await recovered.cardDestinations('fence', fields)).destinations.number,
+   617→          origin,
+   618→        );
+   619→      } finally {
+   620→        await recovered.dispose();
+   621→      }
+   622→    } finally {
+   623→      await computer.dispose();
+   624→      server.closeAllConnections();
+   625→      await new Promise<void>((resolve) => server.close(() => resolve()));
+   626→      await rm(directory, { recursive: true, force: true });
+   627→    }
+   628→  },
+   629→);
+   630→
+   631→test(
+   632→  'native sign-in methods bind observed controls and refuse changed or repeated selections',
+   633→  { skip: process.env.NOD_TEST_NATIVE_DOWNLOAD !== 'true', timeout: 90_000 },
+   634→  async () => {
+   635→    const directory = await mkdtemp(join(tmpdir(), 'nod-method-native-'));
+   636→    const received: string[] = [];
+   637→    const cancelling = new AbortController();
+   638→    const cancelled = deferred();
+   639→    let cancelledMethod: string | undefined;
+   640→    const changes: Record<string, string> = {
+   641→      replaced: 'primary.replaceWith(primary.cloneNode(true))',
+   642→      renamed: "primary.textContent = 'Delete account'",
+   643→      accessibleName: "primary.setAttribute('aria-label', 'Delete account')",
+   644→      destination: "primary.form.action = '/other'",
+   645→      disabled: 'primary.disabled = true',
+   646→      hidden: "primary.style.display = 'none'",
+   647→      base: "document.querySelector('base').href = '/other/'",
+   648→      covered:
+   649→        "const cover=document.createElement('button');cover.style.cssText='position:fixed;inset:0;z-index:1000';cover.textContent='Cover';cover.onclick=()=>fetch('/covered',{method:'POST'});document.body.append(cover)",
+   650→      changedOnPress: "primary.addEventListener('mousedown',()=>primary.form.action='/other')",
+   651→      removedOnRelease: "primary.addEventListener('mouseup',()=>primary.remove())",
+   652→    };
+   653→    const server = createHttpServer(async (request, response) => {
+   654→      if (request.url === '/pressed') {
+   655→        cancelling.abort();
+   656→        await cancelled.promise;
+   657→        response.end();
+   658→        return;
+   659→      }
+   660→      if (request.method === 'POST') {
+   661→        received.push(request.url!);
+   662→        response.writeHead(303, { location: '/done' });
+   663→        response.end();
+   664→        return;
+   665→      }
+   666→      response.setHeader('content-type', 'text/html');
+   667→      if (request.url === '/done') {
+   668→        response.end('<h1>Selected</h1>');
+   669→        return;
+   670→      }
+   671→      if (
+   672→        ['/framed', '/foreign', '/duplicate', '/scaled-half', '/scaled-double'].includes(
+   673→          request.url!,
+   674→        )
+   675→      ) {
+   676→        const scaled = request.url!.startsWith('/scaled-');
+   677→        const source =
+   678→          request.url === '/foreign' || scaled
+   679→            ? `http://localhost:${(server.address() as { port: number }).port}/${scaled ? 'scaled-inner' : 'inner'}`
+   680→            : '/inner';
+   681→        const transform = scaled
+   682→          ? `transform:scale(${request.url === '/scaled-half' ? 0.5 : 2});transform-origin:top left;`
+   683→          : '';
+   684→        response.end(
+   685→          `
+   686→          ${request.url === '/duplicate' ? '<button id="primary">Continue with Example</button>' : ''}
+   687→          <iframe title="Sign in" src="${source}" onload="document.getElementById('frame-state').textContent='Frame ready'" style="width:700px;height:400px;margin:70px 100px;border:12px solid;${transform}"></iframe><button id="reload-frame" onclick="document.getElementById('frame-state').textContent='Loading frame';document.querySelector('iframe').contentWindow.location.reload()">Reload frame</button><p id="frame-state">Loading frame</p>`,
+   688→        );
+   689→        return;
+   690→      }
+   691→      if (request.url === '/cancel') {
+   692→        response.end(
+   693→          '<form action="/selected" method="post"><button id="primary" onmousedown="const xhr=new XMLHttpRequest();xhr.open(\'POST\',\'/pressed\',false);xhr.send()">Continue with Example</button></form><button id="ordinary" onclick="if(event.isTrusted)fetch(\'/ordinary\',{method:\'POST\'})">Continue browsing</button>',
+   694→        );
+   695→        return;
+   696→      }
+   697→      const change = changes[request.url!.slice(1)] ?? '';
+   698→      const primary =
+   699→        request.url === '/image'
+   700→          ? '<input id="primary" type="image" onclick="if(!event.isTrusted)event.preventDefault()" alt="Continue with Example" src="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%22240%22 height=%2240%22%3E%3Crect width=%22240%22 height=%2240%22 fill=%22gray%22/%3E%3C/svg%3E">'
+   701→          : '<button id="primary" onclick="if(!event.isTrusted)event.preventDefault()"><span>Continue with Example</span></button>';
+   702→      response.end(
+   703→        `
+   704→        ${request.url === '/scaled-inner' ? '<script>addEventListener("pointermove",()=>{const xhr=new XMLHttpRequest();xhr.open("POST","/moved",false);xhr.send()},{once:true})</script>' : ''}
+   705→        <base href="/"><form action="selected" method="post">${primary}<button id="alternate" formaction="/alternate">Use another account</button></form><a id="link" href="linked">Continue with Link</a><button id="change" onclick="${change}">Change control</button>`,
+   706→      );
+   707→    });
+   708→    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+   709→    const address = server.address();
+   710→    assert.ok(address && typeof address !== 'string');
+   711→    const origin = `http://127.0.0.1:${address.port}`;
+   712→    let socketPath = '';
+   713→    const makeComputer = () => {
+   714→      const computer = createAgentBrowserComputer({
+   715→        dataRoot: directory,
+   716→        browserExecutable: process.env.NOD_TEST_BROWSER_EXECUTABLE,
+   717→        privateNetwork: true,
+   718→        headless: true,
+   719→        daemonCommand: async (path, command, signal, timeoutMs) => {
+   720→          socketPath = path;
+   721→          return existingDaemonCommand(path, command, signal, timeoutMs);
+   722→        },
+   723→      });
+   724→      const selectMethod = computer.selectSignInMethod!;
+   725→      computer.selectSignInMethod = async (id, input, signal) => {
+   726→        if (input.methodId === cancelledMethod)
+   727→          signal?.addEventListener('abort', () => cancelled.resolve(), { once: true });
+   728→        return selectMethod(id, input, signal);
+   729→      };
+   730→      return computer;
+   731→    };
+   732→    const worker = await harness({ computer: makeComputer });
+   733→    const client = worker.client(directory, { timeoutMs: 30_000 });
+   734→    const act = (input: BrowserAction) => client.act('fixture', input);
+   735→    const choices = [
+   736→      { label: 'Misleading label', selector: '#primary span' },
+   737→      { label: 'Another misleading label', selector: '#alternate' },
+   738→    ];
+   739→    try {
+   740→      await act({ action: 'open', url: origin });
+   741→      await assert.rejects(
+   742→        client.signInMethods!('fixture', origin, [
+   743→          { label: 'First', selector: '#primary' },
+   744→          { label: 'Second', selector: '#primary span' },
+   745→        ]),
+   746→      );
+   747→      const bound = await client.signInMethods!('fixture', origin, choices);
+   748→      assert.deepEqual(
+   749→        bound.methods.map(({ label }) => label),
+   750→        ['Continue with Example', 'Use another account'],
+   751→      );
+   752→      assert.deepEqual(bound.methods[0]!.page.submits, {
+   753→        method: 'POST',
+   754→        to: origin + '/selected',
+   755→      });
+   756→      assert.deepEqual(bound.methods[1]!.page.submits, {
+   757→        method: 'POST',
+   758→        to: origin + '/alternate',
+   759→      });
+   760→      const selection = { origin, document: bound.document, methodId: bound.methods[0]!.id };
+   761→      await assert.rejects(client.selectSignInMethod!('other', selection));
+   762→      await client.selectSignInMethod!('fixture', selection);
+   763→      await act({ action: 'wait', url: '**/done' });
+   764→      assert.deepEqual(received, ['/selected']);
+   765→      await assert.rejects(client.selectSignInMethod!('fixture', selection));
+   766→      await assert.rejects(
+   767→        client.selectSignInMethod!('fixture', { ...selection, methodId: bound.methods[1]!.id }),
+   768→      );
+   769→      for (const change of [...Object.keys(changes), 'navigation', 'origin', 'closed']) {
+   770→        await act({ action: 'open', url: origin + '/' + change });
+   771→        const stale = await client.signInMethods!('fixture', origin, choices);
+   772→        if (change === 'navigation') await act({ action: 'reload' });
+   773→        else if (change === 'closed') await client.close('fixture');
+   774→        else if (change !== 'origin') await act({ action: 'click', selector: '#change' });
+   775→        await assert.rejects(
+   776→          client.selectSignInMethod!('fixture', {
+   777→            origin: change === 'origin' ? 'https://another.example' : origin,
+   778→            document: stale.document,
+   779→            methodId: stale.methods[0]!.id,
+   780→          }),
+   781→        );
+   782→        assert.deepEqual(received, ['/selected']);
+   783→      }
+   784→      await act({ action: 'open', url: origin + '/base' });
+   785→      const linked = await client.signInMethods!('fixture', origin, [
+   786→        { label: 'Ignored', selector: '#link' },
+   787→      ]);
+   788→      await act({ action: 'click', selector: '#change' });
+   789→      await assert.rejects(
+   790→        client.selectSignInMethod!('fixture', {
+   791→          origin,
+   792→          document: linked.document,
+   793→          methodId: linked.methods[0]!.id,
+   794→        }),
+   795→      );
+   796→      assert.deepEqual(received, ['/selected']);
+   797→      await act({ action: 'open', url: origin });
+   798→      const snapshot = (await act({ action: 'snapshot' })).text;
+   799→      const ref = /button "Continue with Example"[^\n]*ref=(e\d+)/.exec(snapshot)?.[1];
+   800→      assert.ok(ref);
+   801→      const byRef = await client.signInMethods!('fixture', origin, [
+   802→        { label: 'Ignored', selector: '@' + ref },
+   803→      ]);
+   804→      assert.equal(byRef.methods[0]!.label, 'Continue with Example');
+   805→      await assert.rejects(
+   806→        client.signInMethods!('fixture', origin, [{ label: 'Ignored', selector: '@e9999' }]),
+   807→      );
+   808→      await act({ action: 'open', url: origin + '/covered' });
+   809→      await act({ action: 'click', selector: '#change' });
+   810→      const covered = /button "Continue with Example"[^\n]*ref=(e\d+)/.exec(
+   811→        (await act({ action: 'snapshot' })).text,
+   812→      )?.[1];
+   813→      assert.ok(covered);
+   814→      await assert.rejects(
+   815→        client.signInMethods!('fixture', origin, [{ label: 'Ignored', selector: '@' + covered }]),
+   816→      );
+   817→      await assert.rejects(
+   818→        client.signInMethods!('fixture', origin, [{ label: 'Ignored', selector: 'button' }]),
+   819→      );
+   820→      await act({ action: 'open', url: origin + '/duplicate' });
+   821→      await assert.rejects(
+   822→        client.signInMethods!('fixture', origin, [{ label: 'Ignored', selector: '#primary' }]),
+   823→      );
+   824→      for (const path of ['/framed', '/foreign']) {
+   825→        await act({ action: 'open', url: origin + path });
+   826→        await act({ action: 'wait', text: 'Frame ready' });
+   827→        const inspect = () =>
+   828→          client.signInMethods!('fixture', origin, [{ label: 'Ignored', selector: '#primary' }]);
+   829→        if (path === '/foreign') {
+   830→          await assert.rejects(inspect());
+   831→          continue;
+   832→        }
+   833→        const framed = await inspect();
+   834→        assert.equal(framed.methods[0]!.label, 'Continue with Example');
+   835→        await act({ action: 'click', selector: '#reload-frame' });
+   836→        await act({ action: 'wait', text: 'Frame ready' });
+   837→        await assert.rejects(
+   838→          client.selectSignInMethod!('fixture', {
+   839→            origin,
+   840→            document: framed.document,
+   841→            methodId: framed.methods[0]!.id,
+   842→          }),
+   843→        );
+   844→        const refreshed = await inspect();
+   845→        assert.equal(refreshed.document, framed.document);
+   846→        await client.selectSignInMethod!('fixture', {
+   847→          origin,
+   848→          document: refreshed.document,
+   849→          methodId: refreshed.methods[0]!.id,
+   850→        });
+   851→        const deadline = Date.now() + 5000;
+   852→        while (received.length < 2 && Date.now() < deadline) await delay(10);
+   853→        assert.deepEqual(received, ['/selected', '/selected']);
+   854→      }
+   855→      const controller = new AbortController();
+   856→      controller.abort();
+   857→      await assert.rejects(client.selectSignInMethod!('fixture', selection, controller.signal));
+   858→      assert.deepEqual(received, ['/selected', '/selected']);
+   859→      await act({ action: 'open', url: origin + '/image' });
+   860→      const image = await client.signInMethods!('fixture', origin, [
+   861→        { label: 'Ignored', selector: '#primary' },
+   862→      ]);
+   863→      assert.equal(image.methods[0]!.label, 'Continue with Example');
+   864→      assert.deepEqual(image.methods[0]!.page.submits, {
+   865→        method: 'POST',
+   866→        to: origin + '/selected',
+   867→      });
+   868→      await client.selectSignInMethod!('fixture', {
+   869→        origin,
+   870→        document: image.document,
+   871→        methodId: image.methods[0]!.id,
+   872→      });
+   873→      await act({ action: 'wait', url: '**/done' });
+   874→      assert.deepEqual(received, ['/selected', '/selected', '/selected']);
+   875→      await assert.rejects(
+   876→        client.selectSignInMethod!('fixture', {
+   877→          origin,
+   878→          document: image.document,
+   879→          methodId: image.methods[0]!.id,
+   880→        }),
+   881→      );
+   882→
+   883→      for (const [index, path] of ['/framed', '/foreign'].entries()) {
+   884→        await act({ action: 'open', url: origin + path });
+   885→        await act({ action: 'wait', text: 'Frame ready' });
+   886→        const connection = await existingDaemonCommand(socketPath, { action: 'cdp_url' });
+   887→        const tabs = await existingDaemonCommand(socketPath, { action: 'tab_list' });
+   888→        const tab = (tabs.tabs as { active: boolean; targetId: string }[]).find(
+   889→          (value) => value.active,
+   890→        )!;
+   891→        let inspector = await openDevtools(String(connection.cdpUrl), tab.targetId);
+   892→        try {
+   893→          const bound = await inspector.signInControl({ pixel: { x: 150, y: 100 } });
+   894→          assert.equal(
+   895→            bound.origin,
+   896→            path === '/foreign' ? `http://localhost:${address.port}` : origin,
+   897→          );
+   898→          assert.equal(bound.targetFrameId === bound.frameId, path === '/foreign');
+   899→          assert.notEqual(bound.loaderId, await inspector.document());
+   900→          if (path === '/framed') {
+   901→            await act({ action: 'click', selector: '#reload-frame' });
+   902→            await act({ action: 'wait', text: 'Frame ready' });
+   903→            await assert.rejects(inspector.selectSignInControl(bound));
+   904→          }
+   905→          inspector.close();
+   906→          inspector = await openDevtools(String(connection.cdpUrl), tab.targetId);
+   907→          const current = await inspector.signInControl({ pixel: { x: 150, y: 100 } });
+   908→          inspector.close();
+   909→          inspector = await openDevtools(String(connection.cdpUrl), tab.targetId);
+   910→          await inspector.selectSignInControl(current);
+   911→          const deadline = Date.now() + 5000;
+   912→          while (received.length < 4 + index && Date.now() < deadline) await delay(10);
+   913→          assert.deepEqual(received, Array(4 + index).fill('/selected'));
+   914→          await assert.rejects(inspector.selectSignInControl(current));
+   915→        } finally {
+   916→          inspector.close();
+   917→        }
+   918→      }
+   919→      for (const path of ['/scaled-half', '/scaled-double']) {
+   920→        await act({ action: 'open', url: origin + path });
+   921→        await act({ action: 'wait', text: 'Frame ready' });
+   922→        const connection = await existingDaemonCommand(socketPath, { action: 'cdp_url' });
+   923→        const tabs = await existingDaemonCommand(socketPath, { action: 'tab_list' });
+   924→        const tab = (tabs.tabs as { active: boolean; targetId: string }[]).find(
+   925→          (value) => value.active,
+   926→        )!;
+   927→        const inspector = await openDevtools(String(connection.cdpUrl), tab.targetId);
+   928→        try {
+   929→          const bound = await inspector.signInControl({ selector: '#primary' });
+   930→          await assert.rejects(inspector.selectSignInControl(bound));
+   931→          assert.deepEqual(received, Array(5).fill('/selected'));
+   932→        } finally {
+   933→          inspector.close();
+   934→        }
+   935→      }
+   936→      await act({ action: 'open', url: origin + '/cancel' });
+   937→      const interrupted = await client.signInMethods!('fixture', origin, [
+   938→        { label: 'Ignored', selector: '#primary' },
+   939→      ]);
+   940→      cancelledMethod = interrupted.methods[0]!.id;
+   941→      const interruptedSelection = {
+   942→        origin,
+   943→        document: interrupted.document,
+   944→        methodId: cancelledMethod,
+   945→      };
+   946→      await assert.rejects(
+   947→        client.selectSignInMethod!('fixture', interruptedSelection, cancelling.signal),
+   948→      );
+   949→      assert.equal(cancelling.signal.aborted, true);
+   950→      assert.deepEqual(received, Array(5).fill('/selected'));
+   951→      await assert.rejects(client.selectSignInMethod!('fixture', interruptedSelection));
+   952→      await assert.rejects(act({ action: 'click', selector: '#ordinary' }), /unavailable/);
+   953→      await act({ action: 'open', url: origin + '/cancel' });
+   954→      await act({ action: 'click', selector: '#ordinary' });
+   955→      const deadline = Date.now() + 5000;
+   956→      while (received.length < 6 && Date.now() < deadline) await delay(10);
+   957→      assert.deepEqual(received, [...Array(5).fill('/selected'), '/ordinary']);
+   958→    } finally {
+   959→      await worker.close();
+   960→      server.closeAllConnections();
+   961→      await new Promise<void>((resolve) => server.close(() => resolve()));
+   962→      await rm(directory, { recursive: true, force: true });
+   963→    }
+   964→  },
+   965→);
+   966→

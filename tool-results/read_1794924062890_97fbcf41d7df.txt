@@ -1,0 +1,2002 @@
+     1→import assert from 'node:assert/strict';
+     2→import test, { describe } from 'node:test';
+     3→import Fastify from 'fastify';
+     4→import type { AccountStore } from '../src/server/account-store.ts';
+     5→import type { AccountSettings } from '../src/shared/account.ts';
+     6→import { createAccountSession } from '../src/server/account.ts';
+     7→import { registerLocalAccess } from '../src/server/access.ts';
+     8→import { randomUUID, randomBytes } from 'node:crypto';
+     9→import pg from 'pg';
+    10→import { createKeychainKeyStore } from '../src/providers/keychain/key-store.ts';
+    11→import { createFilesystemKeyStore } from '../src/providers/filesystem/key-store.ts';
+    12→import { openCredential, sealCredential } from '../src/server/vault.ts';
+    13→import { chmod, lstat, mkdtemp, readFile, readdir, rm, symlink } from 'node:fs/promises';
+    14→import { homedir, tmpdir } from 'node:os';
+    15→import { join } from 'node:path';
+    16→import type { ProductAnalytics } from '../src/ports/analytics.ts';
+    17→import { createAnalytics, type Analytics, type CaptureAnalytics } from '../src/server/analytics.ts';
+    18→import { createLedger } from '../src/server/ledger.ts';
+    19→import {
+    20→  createDecisionModel,
+    21→  createOpenRouterDecisionCatalog,
+    22→  type DecisionConnection,
+    23→} from '../src/providers/decisions.ts';
+    24→import { createMailCheck } from '../src/server/mail-check.ts';
+    25→import type { DecisionQuestion } from '../src/ports/decisions.ts';
+    26→import { createModelTraces } from '../src/server/traces.ts';
+    27→import type { ModelTrace } from '../src/ports/traces.ts';
+    28→import type { ProviderUsageEvent } from '../src/ports/provider-usage.ts';
+    29→import { setRequestAccount } from '../src/web/lib/api.ts';
+    30→import { createOtlpTelemetry } from '../src/providers/otlp/telemetry.ts';
+    31→import { trustBasis, trustDecision } from '../src/server/trust-basis.ts';
+    32→import { createTrust } from '../src/server/trust.ts';
+    33→import { createTrustReview } from '../src/server/trust-review.ts';
+    34→import { trustFacts } from '../src/server/trust-facts.ts';
+    35→import {
+    36→  createErrorRedactor,
+    37→  createRedactor,
+    38→  createTextRedactor,
+    39→} from '../src/server/redaction.ts';
+    40→
+    41→test('decision reservations release only requests that did not reach dispatch', async () => {
+    42→  for (const phase of ['before dispatch', 'provider error', 'transport error']) {
+    43→    const controller = new AbortController();
+    44→    const settled: Array<number | null> = [];
+    45→    const usage: ProviderUsageEvent[] = [];
+    46→    let calls = 0;
+    47→    const model = createDecisionModel({
+    48→      resolve: async () => ({ provider: 'openai', key: 'synthetic-decision-key' }),
+    49→      reserve: async () => {
+    50→        if (phase === 'before dispatch') controller.abort();
+    51→        return async (cost) => {
+    52→          settled.push(cost);
+    53→        };
+    54→      },
+    55→      fetch: async () => {
+    56→        calls++;
+    57→        if (phase === 'transport error')
+    58→          throw new Error('Synthetic connection lost after dispatch.');
+    59→        return new Response('', { status: 503 });
+    60→      },
+    61→    });
+    62→    await assert.rejects(
+    63→      model.check(
+    64→        {
+    65→          instructions: 'Check synthetic access.',
+    66→          input: {},
+    67→          question: {
+    68→            name: 'access',
+    69→            choices: [
+    70→              { value: false, description: 'Ordinary mail.' },
+    71→              { value: true, description: 'Access secret.' },
+    72→            ],
+    73→          },
+    74→        },
+    75→        controller.signal,
+    76→        (event) => usage.push(event),
+    77→      ),
+    78→    );
+    79→    assert.equal(calls, phase === 'before dispatch' ? 0 : 1);
+    80→    assert.deepEqual(settled, [phase === 'before dispatch' ? 0 : null]);
+    81→    assert.equal(usage[0]?.costUsd, phase === 'before dispatch' ? 0 : null);
+    82→  }
+    83→});
+    84→
+    85→test('decision selection uses the LLM only when no decision connection is available', async () => {
+    86→  let resolutions = 0;
+    87→  let llm = 0;
+    88→  let state = 'absent';
+    89→  const decisions = createDecisionModel({
+    90→    resolve: async () => {
+    91→      resolutions++;
+    92→      if (state === 'absent') return undefined;
+    93→      if (state === 'lookup error') throw new Error('Synthetic lookup failure.');
+    94→      return { provider: 'openai', key: 'fixture-key' };
+    95→    },
+    96→    fetch: async () => {
+    97→      if (state === 'request error') return new Response('', { status: 503 });
+    98→      return Response.json({
+    99→        answers: [
+   100→          {
+   101→            name: 'answer',
+   102→            type: 'choice',
+   103→            choice: 'yes',
+   104→            probabilities: [
+   105→              { value: 'yes', probability: 1 },
+   106→              { value: 'other', probability: 0 },
+   107→            ],
+   108→          },
+   109→        ],
+   110→        usage: { input_tokens: 1 },
+   111→      });
+   112→    },
+   113→  });
+   114→  const question: DecisionQuestion = {
+   115→    name: 'answer',
+   116→    minProbability: 0.99,
+   117→    choices: [
+   118→      { value: 'yes', description: 'Approve.' },
+   119→      { value: 'other', description: 'No approval.' },
+   120→    ],
+   121→  };
+   122→  const review = createTrustReview({
+   123→    decisions,
+   124→    review: async (instructions, input, signal, selected) => {
+   125→      llm++;
+   126→      assert.equal(instructions, 'Apply policy.');
+   127→      assert.deepEqual(input, { reply: 'Yes.' });
+   128→      assert.equal(signal, undefined);
+   129→      assert.deepEqual(selected, { name: question.name, choices: question.choices });
+   130→      return { answer: 'yes' };
+   131→    },
+   132→  });
+   133→  const check = (signal?: AbortSignal) =>
+   134→    review('Apply policy.', { reply: 'Yes.' }, signal, question);
+   135→  assert.deepEqual(await check(), { answer: 'yes' });
+   136→  assert.equal(llm, 1);
+   137→  state = 'available';
+   138→  const selected = await decisions.select!();
+   139→  const count = resolutions;
+   140→  state = 'lookup error';
+   141→  assert.equal(
+   142→    ((await selected!.check({ instructions: '', input: {}, question })) as { answer: string })
+   143→      .answer,
+   144→    'yes',
+   145→  );
+   146→  assert.equal(resolutions, count);
+   147→  await assert.rejects(check(), /lookup failure/);
+   148→  state = 'request error';
+   149→  await assert.rejects(check());
+   150→  await assert.rejects(check(AbortSignal.abort()));
+   151→  assert.equal(llm, 1);
+   152→});
+   153→
+   154→test('OpenAI decision failures keep the region and provider reason without exposing the key', async () => {
+   155→  const key = 'fixture-decision-"key';
+   156→  let calls = 0;
+   157→  const decisions = createDecisionModel({
+   158→    resolve: async () => ({ provider: 'openai', key, region: 'eu' }),
+   159→    fetch: async (input, init) => {
+   160→      calls++;
+   161→      assert.equal(String(input), 'https://eu.api.openai.com/v1/decisions');
+   162→      assert.equal(new Headers(init?.headers).get('authorization'), `Bearer ${key}`);
+   163→      return Response.json(
+   164→        { error: { message: `Synthetic project geography EU error ${key}` } },
+   165→        { status: 401 },
+   166→      );
+   167→    },
+   168→  });
+   169→  await assert.rejects(
+   170→    decisions.check({
+   171→      instructions: 'Apply the synthetic rule.',
+   172→      input: {},
+   173→      question: { name: 'answer', choices: [{ value: false, description: 'Ask.' }] },
+   174→    }),
+   175→    (error: Error) => {
+   176→      assert.match(error.message, /401/);
+   177→      assert.match(error.message, /project geography EU/);
+   178→      assert.ok(!error.message.includes(key));
+   179→      assert.ok(!error.message.includes(JSON.stringify(key).slice(1, -1)));
+   180→      return true;
+   181→    },
+   182→  );
+   183→  assert.equal(calls, 1);
+   184→});
+   185→
+   186→test('About accepts multiple choices and records only confirmed sharing', async (t) => {
+   187→  const { JSDOM } = await import('jsdom');
+   188→  const { act, createElement } = await import('react');
+   189→  const dom = new JSDOM('<!doctype html><div id="root"></div>', {
+   190→    url: 'https://nod.example.test/onboarding',
+   191→  });
+   192→  dom.window.HTMLElement.prototype.scrollIntoView = () => {};
+   193→  Object.defineProperty(dom.window, 'matchMedia', { value: () => ({ matches: true }) });
+   194→  const globals = {
+   195→    window: dom.window,
+   196→    document: dom.window.document,
+   197→    HTMLElement: dom.window.HTMLElement,
+   198→    Element: dom.window.Element,
+   199→    Node: dom.window.Node,
+   200→    Event: dom.window.Event,
+   201→    IS_REACT_ACT_ENVIRONMENT: true,
+   202→  };
+   203→  const originals = new Map(
+   204→    Object.keys(globals).map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)]),
+   205→  );
+   206→  for (const [key, value] of Object.entries(globals))
+   207→    Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
+   208→  const { createRoot } = await import('react-dom/client');
+   209→  let root = createRoot(dom.window.document.getElementById('root')!);
+   210→  t.after(async () => {
+   211→    await act(async () => root.unmount());
+   212→    dom.window.close();
+   213→    for (const [key, value] of originals)
+   214→      if (value) Object.defineProperty(globalThis, key, value);
+   215→      else Reflect.deleteProperty(globalThis, key);
+   216→  });
+   217→  const { About } = await import('../src/web/pages/onboarding/steps/about.tsx');
+   218→  const { readStored } = await import('../src/web/pages/onboarding/storage.ts');
+   219→  const { profileScopes, profileRoles, profileWhoFor, profileCompanySizes, profileJobs } =
+   220→    await import('../src/shared/onboarding.ts');
+   221→  let status = 200;
+   222→  let shared = true;
+   223→  const submissions: { roles: string[]; jobs: string[] }[] = [];
+   224→  t.mock.method(globalThis, 'fetch', async (path: RequestInfo | URL, options?: RequestInit) => {
+   225→    assert.equal(String(path), '/api/onboarding/profile');
+   226→    submissions.push(JSON.parse(String(options?.body)));
+   227→    return Response.json(
+   228→      status === 200 ? { ok: true, shared } : { error: 'Could not share your choices.' },
+   229→      { status },
+   230→    );
+   231→  });
+   232→  let completed = 0;
+   233→  await act(async () =>
+   234→    root.render(
+   235→      createElement(About, {
+   236→        arrived: 'forward',
+   237→        quiet: true,
+   238→        onNext: () => completed++,
+   239→        onBack() {},
+   240→        usageShared: true,
+   241→      }),
+   242→    ),
+   243→  );
+   244→  const clickChoice = async (options: readonly { id: string }[], id: string) => {
+   245→    const index = options.findIndex((option) => option.id === id);
+   246→    assert.notEqual(index, -1);
+   247→    const button = dom.window.document.querySelectorAll<HTMLButtonElement>(
+   248→      '.ob-chips .ob-chip[aria-pressed]',
+   249→    )[index];
+   250→    assert.ok(button, id);
+   251→    await act(async () => button.click());
+   252→  };
+   253→  const primary = async () => {
+   254→    const button = dom.window.document.querySelector<HTMLButtonElement>('.ob-next');
+   255→    assert.ok(button);
+   256→    await act(async () => button.click());
+   257→  };
+   258→  const remount = async () => {
+   259→    await act(async () => root.unmount());
+   260→    root = createRoot(dom.window.document.getElementById('root')!);
+   261→    await act(async () =>
+   262→      root.render(
+   263→        createElement(About, {
+   264→          arrived: 'back',
+   265→          quiet: true,
+   266→          onNext: () => completed++,
+   267→          onBack() {},
+   268→          usageShared: true,
+   269→        }),
+   270→      ),
+   271→    );
+   272→  };
+   273→  const workRoles = profileRoles.filter((option) => !('personal' in option));
+   274→  await clickChoice(profileScopes, 'work');
+   275→  await clickChoice(workRoles, 'agency');
+   276→  await clickChoice(workRoles, 'engineering');
+   277→  await primary();
+   278→  await clickChoice(profileWhoFor, 'clients');
+   279→  await clickChoice(profileCompanySizes, '2_10');
+   280→  await clickChoice(profileJobs, 'email');
+   281→  await clickChoice(profileJobs, 'meetings');
+   282→  await primary();
+   283→  assert.deepEqual(submissions[0]?.roles, ['agency', 'engineering']);
+   284→  assert.deepEqual(submissions[0]?.jobs, ['email', 'meetings']);
+   285→  assert.equal(submissions.length, 1);
+   286→  assert.equal(completed, 1);
+   287→  const sharedChoices = {
+   288→    onboarding_profile_completed: true,
+   289→    onboarding_scope: 'work',
+   290→    onboarding_roles: ['agency', 'engineering'],
+   291→    onboarding_who_for: 'clients',
+   292→    onboarding_company_size: '2_10',
+   293→    onboarding_jobs: ['email', 'meetings'],
+   294→  };
+   295→  assert.deepEqual(readStored('about-shared'), sharedChoices);
+   296→  assert.equal(readStored<{ current: string }>('about')?.current, 'done');
+   297→  await remount();
+   298→  await primary();
+   299→  assert.equal(completed, 2);
+   300→  assert.equal(submissions.length, 2);
+   301→  assert.deepEqual(readStored('about-shared'), sharedChoices);
+   302→  shared = false;
+   303→  await primary();
+   304→  assert.equal(readStored('about-shared'), null);
+   305→  assert.equal(completed, 3);
+   306→  status = 502;
+   307→  await primary();
+   308→  assert.equal(readStored('about-shared'), null);
+   309→  const retry = dom.window.document.querySelector<HTMLButtonElement>(
+   310→    '.ob-footer-end button:not(.ob-next)',
+   311→  );
+   312→  assert.ok(retry);
+   313→  await act(async () => retry.click());
+   314→  assert.equal(completed, 3);
+   315→  assert.equal(submissions.length, 5);
+   316→  await primary();
+   317→  assert.equal(readStored('about-shared'), null);
+   318→  assert.equal(completed, 4);
+   319→  assert.equal(submissions.length, 5);
+   320→  assert.equal(readStored<{ current: string }>('about')?.current, 'done');
+   321→  status = 200;
+   322→  shared = true;
+   323→  await remount();
+   324→  await primary();
+   325→  assert.equal(completed, 5);
+   326→  assert.equal(submissions.length, 5);
+   327→  assert.equal(readStored('about-shared'), null);
+   328→});
+   329→
+   330→test('Join sends fixed answers only with a matching confirmed share', async (t) => {
+   331→  const { JSDOM } = await import('jsdom');
+   332→  const { act, createElement } = await import('react');
+   333→  const dom = new JSDOM('<!doctype html><div id="root"></div>', {
+   334→    url: 'https://nod.example.test/onboarding',
+   335→  });
+   336→  const globals = {
+   337→    window: dom.window,
+   338→    document: dom.window.document,
+   339→    HTMLElement: dom.window.HTMLElement,
+   340→    HTMLInputElement: dom.window.HTMLInputElement,
+   341→    Element: dom.window.Element,
+   342→    Node: dom.window.Node,
+   343→    Event: dom.window.Event,
+   344→    IS_REACT_ACT_ENVIRONMENT: true,
+   345→  };
+   346→  const originals = new Map(
+   347→    Object.keys(globals).map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)]),
+   348→  );
+   349→  for (const [key, value] of Object.entries(globals))
+   350→    Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
+   351→  const { createRoot } = await import('react-dom/client');
+   352→  const root = createRoot(dom.window.document.getElementById('root')!);
+   353→  t.after(async () => {
+   354→    await act(async () => root.unmount());
+   355→    dom.window.close();
+   356→    for (const [key, value] of originals)
+   357→      if (value) Object.defineProperty(globalThis, key, value);
+   358→      else Reflect.deleteProperty(globalThis, key);
+   359→  });
+   360→  const { Join } = await import('../src/web/pages/onboarding/steps/join.tsx');
+   361→  const { writeStored } = await import('../src/web/pages/onboarding/storage.ts');
+   362→  const profile = {
+   363→    scope: 'work',
+   364→    roles: ['engineering'],
+   365→    roleText: 'Private synthetic role',
+   366→    companySize: '11_100',
+   367→    jobs: ['research'],
+   368→    jobsText: 'Private synthetic task',
+   369→  };
+   370→  writeStored('about', { current: 'done', profile });
+   371→  const fixed = {
+   372→    onboarding_profile_completed: true,
+   373→    onboarding_scope: 'work',
+   374→    onboarding_roles: ['engineering', 'other'],
+   375→    onboarding_who_for: 'not_asked',
+   376→    onboarding_company_size: '11_100',
+   377→    onboarding_jobs: ['research', 'other'],
+   378→  };
+   379→  const posted: unknown[] = [];
+   380→  t.mock.method(globalThis, 'fetch', async (path: RequestInfo | URL, options?: RequestInit) => {
+   381→    assert.equal(String(path), '/api/onboarding/updates-email');
+   382→    assert.equal(options?.method, 'POST');
+   383→    posted.push(JSON.parse(String(options?.body)));
+   384→    return Response.json({ ok: true });
+   385→  });
+   386→  let completed = 0;
+   387→  const render = (usageShared: boolean) =>
+   388→    act(async () =>
+   389→      root.render(
+   390→        createElement(Join, {
+   391→          arrived: 'forward',
+   392→          onNext: () => completed++,
+   393→          onBack() {},
+   394→          updatesEmail: true,
+   395→          usageShared,
+   396→        }),
+   397→      ),
+   398→    );
+   399→  await render(false);
+   400→  assert.equal(dom.window.document.querySelector('#ob-join-email'), null);
+   401→  await render(true);
+   402→  const email = dom.window.document.querySelector<HTMLInputElement>('#ob-join-email');
+   403→  const consent = dom.window.document.querySelector<HTMLInputElement>('.ob-join-consent input');
+   404→  const next = dom.window.document.querySelector<HTMLButtonElement>('.ob-next');
+   405→  assert.ok(email);
+   406→  assert.ok(consent);
+   407→  assert.ok(next);
+   408→  await act(async () => {
+   409→    Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, 'value')!.set!.call(
+   410→      email,
+   411→      'owner@example.test',
+   412→    );
+   413→    email.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
+   414→  });
+   415→  await act(async () => next.click());
+   416→  assert.deepEqual(posted, []);
+   417→  assert.equal(completed, 0);
+   418→  await act(async () => consent.click());
+   419→  await act(async () => next.click());
+   420→  assert.deepEqual(posted[0], { email: 'owner@example.test', consent: true });
+   421→  writeStored('about-shared', fixed);
+   422→  await act(async () => next.click());
+   423→  assert.deepEqual(posted[1], { email: 'owner@example.test', consent: true, profile: fixed });
+   424→  assert.equal(JSON.stringify(posted).includes('Private synthetic'), false);
+   425→  assert.equal(completed, 2);
+   426→  writeStored('about', { current: 'roles', profile });
+   427→  await act(async () => next.click());
+   428→  assert.deepEqual(posted[2], { email: 'owner@example.test', consent: true });
+   429→  writeStored('about', { current: 'done', profile: { ...profile, jobs: ['email'] } });
+   430→  await act(async () => next.click());
+   431→  assert.deepEqual(posted[3], { email: 'owner@example.test', consent: true });
+   432→  assert.equal(completed, 4);
+   433→});
+   434→
+   435→test('decision catalog filters native text decisions, expires and refuses failed lookups', async (t) => {
+   436→  t.mock.timers.enable({ apis: ['Date'], now: 1_000 });
+   437→  let calls = 0;
+   438→  let fail = false;
+   439→  let malformed = false;
+   440→  t.mock.method(globalThis, 'fetch', async (_url: RequestInfo | URL, init?: RequestInit) => {
+   441→    calls++;
+   442→    assert.equal(init?.redirect, 'error');
+   443→    if (fail) return new Response('', { status: 503 });
+   444→    if (malformed) return Response.json({ data: null });
+   445→    return Response.json({
+   446→      data: [
+   447→        {
+   448→          id: 'typesafe/jev-1.14',
+   449→          architecture: { input_modalities: ['text'], output_modalities: ['decisions'] },
+   450→          endpoints: ['/api/alpha/decisions'],
+   451→        },
+   452→        {
+   453→          id: 'typesafe/jev-router',
+   454→          architecture: { input_modalities: ['text'], output_modalities: ['text'] },
+   455→          endpoints: ['/api/v1/chat/completions'],
+   456→        },
+   457→        {
+   458→          id: 'fixture/extraction',
+   459→          architecture: { input_modalities: ['text'], output_modalities: ['decisions'] },
+   460→          endpoints: ['/api/alpha/extractions'],
+   461→        },
+   462→        {
+   463→          id: 'fixture/image',
+   464→          architecture: { input_modalities: ['image'], output_modalities: ['decisions'] },
+   465→          endpoints: ['/api/alpha/decisions'],
+   466→        },
+   467→      ],
+   468→    });
+   469→  });
+   470→  const catalog = createOpenRouterDecisionCatalog();
+   471→  assert.deepEqual([...(await catalog('fixture-key'))], ['typesafe/jev-1.14']);
+   472→  await catalog('fixture-key');
+   473→  assert.equal(calls, 1);
+   474→  t.mock.timers.tick(300_000);
+   475→  fail = true;
+   476→  await assert.rejects(catalog('fixture-key'));
+   477→  assert.equal(calls, 2);
+   478→  fail = false;
+   479→  await catalog('fixture-key');
+   480→  await catalog('fixture-rotated-key');
+   481→  assert.equal(calls, 4);
+   482→  malformed = true;
+   483→  await assert.rejects(catalog('fixture-invalid-key'));
+   484→  await assert.rejects(catalog('fixture-rotated-key', AbortSignal.abort()));
+   485→  assert.equal(calls, 5);
+   486→});
+   487→
+   488→test('decision trust never calls an LLM for uncertainty, missing results or failure', async () => {
+   489→  let calls = 0;
+   490→  let choice = 'message:0';
+   491→  let probability = 0.995;
+   492→  let fail = false;
+   493→  const decisions = createDecisionModel({
+   494→    resolve: async () => ({ provider: 'openrouter', key: 'synthetic-decision-key' }),
+   495→    fetch: async (_url, init) => {
+   496→      const request = JSON.parse(String(init?.body));
+   497→      if (fail) return new Response('', { status: 503 });
+   498→      return Response.json({
+   499→        answers: {
+   500→          ...Object.fromEntries(
+   501→            Object.keys(request.questions)
+   502→              .filter((name) => !['trust', 'preparation', 'permission'].includes(name))
+   503→              .map((name) => [
+   504→                name,
+   505→                {
+   506→                  type: 'choice',
+   507→                  choice: String(name === 'scope'),
+   508→                  probabilities: {
+   509→                    true: Number(name === 'scope'),
+   510→                    false: Number(name !== 'scope'),
+   511→                  },
+   512→                },
+   513→              ]),
+   514→          ),
+   515→          trust: {
+   516→            type: 'choice',
+   517→            choice,
+   518→            probabilities: {
+   519→              'message:0': choice === 'message:0' ? probability : 1 - probability,
+   520→              read: 0,
+   521→              ask: choice === 'ask' ? probability : 1 - probability,
+   522→            },
+   523→          },
+   524→          preparation: { type: 'choice', choice: 'false', probabilities: { true: 0, false: 1 } },
+   525→          permission: {
+   526→            type: 'choice',
+   527→            choice: choice === 'ask' ? 'false' : 'true',
+   528→            probabilities: {
+   529→              true: choice === 'ask' ? 1 - probability : probability,
+   530→              false: choice === 'ask' ? probability : 1 - probability,
+   531→            },
+   532→          },
+   533→        },
+   534→        usage: { input_tokens: 10, cost: 0.000001 },
+   535→      });
+   536→    },
+   537→  });
+   538→  const words = { userMessages: [{ at: '2026-11-03T09:00:00Z', text: 'Send the report to Ana.' }] };
+   539→  const input = {
+   540→    ...words,
+   541→    action: { name: 'send_email', arguments: { recipient: 'ana@example.test' } },
+   542→  };
+   543→  const instructions = 'Apply the unchanged permission policy.';
+   544→  const review = createTrustReview({
+   545→    decisions,
+   546→    review: async () => {
+   547→      calls++;
+   548→      assert.fail('Decision checks must not call an LLM.');
+   549→    },
+   550→  });
+   551→  assert.equal(
+   552→    trustBasis(await review(instructions, input), withOwnerIds(words, ['message']))?.kind,
+   553→    'message',
+   554→  );
+   555→  assert.equal(calls, 0);
+   556→  probability = 0.8;
+   557→  assert.equal(
+   558→    trustBasis(await review(instructions, input), withOwnerIds(words, ['message'])),
+   559→    undefined,
+   560→  );
+   561→  assert.equal(calls, 0);
+   562→  choice = 'ask';
+   563→  probability = 0.995;
+   564→  assert.equal(
+   565→    trustBasis(await review(instructions, input), withOwnerIds(words, ['message'])),
+   566→    undefined,
+   567→  );
+   568→  assert.equal(calls, 0);
+   569→  fail = true;
+   570→  await assert.rejects(review(instructions, input));
+   571→  assert.equal(calls, 0);
+   572→  const unavailable = createTrustReview({
+   573→    decisions: {
+   574→      configured: false,
+   575→      check: async () => assert.fail('Do not send an unavailable request.'),
+   576→    },
+   577→    review: async () => assert.fail('Missing configuration must not start an LLM request.'),
+   578→  });
+   579→  assert.equal(await unavailable(instructions, input), undefined);
+   580→  for (const output of [
+   581→    undefined,
+   582→    {},
+   583→    {
+   584→      trust: 'message:0',
+   585→      probability: 1,
+   586→      additional: { permission: { permission: true, probability: 1 } },
+   587→    },
+   588→  ]) {
+   589→    const missing = createTrustReview({
+   590→      decisions: { check: async () => output },
+   591→      review: async () => assert.fail('Missing results must not select another model.'),
+   592→    });
+   593→    assert.equal(await missing(instructions, input), undefined);
+   594→  }
+   595→  const unscored = createTrustReview({
+   596→    decisions: { check: async () => ({ answer: 'yes' }) },
+   597→    review: async () => assert.fail('An answer without confidence must not start another model.'),
+   598→  });
+   599→  assert.equal(
+   600→    await unscored(instructions, input, undefined, {
+   601→      name: 'answer',
+   602→      minProbability: 0.99,
+   603→      choices: [
+   604→        { value: 'yes', description: 'Approve.' },
+   605→        { value: 'other', description: 'No approval.' },
+   606→      ],
+   607→    }),
+   608→    undefined,
+   609→  );
+   610→  await assert.rejects(review(instructions, input, AbortSignal.abort()));
+   611→  assert.equal(calls, 0);
+   612→});
+   613→
+   614→test('uncertain effects cannot authorize a change through confident permission', async () => {
+   615→  const input = { userMessages: [{ at: '2026-11-03T09:00:00Z', text: 'Update my meeting.' }] };
+   616→  const decisions = {
+   617→    check: async () => ({
+   618→      trust: 'message:0',
+   619→      probability: 0.93,
+   620→      additional: {
+   621→        preparation: { preparation: false, choice: false, probability: 0.96 },
+   622→        permission: { permission: true, choice: true, probability: 0.99 },
+   623→      },
+   624→    }),
+   625→  };
+   626→  let calls = 0;
+   627→  const review = async (instructions: string, data: object) => {
+   628→    calls++;
+   629→    assert.equal(instructions, 'Original policy');
+   630→    assert.equal(data, input);
+   631→    return { run: false };
+   632→  };
+   633→  assert.equal(
+   634→    trustBasis(
+   635→      await createTrustReview({ decisions, review })('Original policy', input),
+   636→      withOwnerIds(input, ['message']),
+   637→    ),
+   638→    undefined,
+   639→  );
+   640→  assert.equal(calls, 0);
+   641→});
+   642→
+   643→test('batched trust validates all answers, records one request, and refuses conflicts', async (t) => {
+   644→  for (const provider of ['openai', 'typesafe', 'openrouter'] as const)
+   645→    await t.test(provider, async () => {
+   646→      let primary = 0.8;
+   647→      let conflict = false;
+   648→      let missing = false;
+   649→      let duplicate = false;
+   650→      const usage: ProviderUsageEvent[] = [];
+   651→      const words = {
+   652→        userMessages: [{ at: '2026-11-03T09:00:00Z', text: 'Read my project list.' }],
+   653→      };
+   654→      const model = createDecisionModel({
+   655→        resolve: async () => ({ provider, key: 'synthetic-batch-key' }),
+   656→        fetch: async (_url, init) => {
+   657→          const body = JSON.parse(String(init?.body));
+   658→          const questions = provider === 'openai' ? body.questions : Object.values(body.questions);
+   659→          assert.equal(questions.length, 11);
+   660→          assert.doesNotMatch(questions[0].instructions, /Complete permission policy/);
+   661→          assert.match(questions[2].instructions, /Complete permission policy/);
+   662→          assert.doesNotMatch(questions[1].instructions, /Complete permission policy/);
+   663→          const answers = [
+   664→            {
+   665→              name: 'trust',
+   666→              type: 'choice',
+   667→              choice: 'message:0',
+   668→              probabilities: { 'message:0': primary, ask: 1 - primary, read: 0 },
+   669→            },
+   670→            {
+   671→              name: duplicate ? 'trust' : 'preparation',
+   672→              type: 'choice',
+   673→              choice: provider === 'openai' ? true : 'true',
+   674→              probabilities: { true: 1, false: 0 },
+   675→            },
+   676→            {
+   677→              name: 'permission',
+   678→              type: 'choice',
+   679→              choice: provider === 'openai' ? !conflict : String(!conflict),
+   680→              probabilities: { true: conflict ? 0 : 1, false: conflict ? 1 : 0 },
+   681→            },
+   682→            ...[
+   683→              'scope',
+   684→              'constraints',
+   685→              'time',
+   686→              'numbers',
+   687→              'conditions',
+   688→              'targets',
+   689→              'bans',
+   690→              'costs',
+   691→            ].map((name) => ({
+   692→              name,
+   693→              type: 'choice',
+   694→              choice: provider === 'openai' ? false : 'false',
+   695→              probabilities: { true: 0, false: 1 },
+   696→            })),
+   697→          ].slice(0, missing ? 1 : 11);
+   698→          return Response.json({
+   699→            answers:
+   700→              provider === 'openai'
+   701→                ? answers.map(({ probabilities, ...answer }) => ({
+   702→                    ...answer,
+   703→                    probabilities: Object.entries(probabilities).map(([value, probability]) => ({
+   704→                      value: value === 'true' ? true : value === 'false' ? false : value,
+   705→                      probability,
+   706→                    })),
+   707→                  }))
+   708→                : Object.fromEntries(answers.map(({ name, ...answer }) => [name, answer])),
+   709→            usage: { input_tokens: 100, cost: 0.00001 },
+   710→          });
+   711→        },
+   712→      });
+   713→      const decisions = {
+   714→        check: (request: Parameters<typeof model.check>[0], signal?: AbortSignal) =>
+   715→          model.check(request, signal, (event) => usage.push(event)),
+   716→      };
+   717→      const review = createTrustReview({
+   718→        decisions,
+   719→        review: async () => assert.fail('A proven read needs no LLM.'),
+   720→      });
+   721→      const input = { ...words, action: { name: 'list_projects', arguments: {} } };
+   722→      assert.equal(
+   723→        trustBasis(
+   724→          await review('Complete permission policy', input),
+   725→          withOwnerIds(words, ['message']),
+   726→        )?.kind,
+   727→        'read',
+   728→      );
+   729→      assert.equal(usage.length, 1);
+   730→      assert.equal(usage[0]?.costUsd, 0.00001);
+   731→      primary = 0.995;
+   732→      conflict = true;
+   733→      assert.equal(
+   734→        trustBasis(
+   735→          await review('Complete permission policy', input),
+   736→          withOwnerIds(words, ['message']),
+   737→        ),
+   738→        undefined,
+   739→      );
+   740→      assert.equal(usage.length, 2);
+   741→      missing = true;
+   742→      await assert.rejects(review('Complete permission policy', input));
+   743→      assert.equal(usage.at(-1)?.status, 'failed');
+   744→      assert.equal(usage.length, 3);
+   745→      missing = false;
+   746→      duplicate = true;
+   747→      await assert.rejects(review('Complete permission policy', input));
+   748→      assert.equal(usage.at(-1)?.status, 'failed');
+   749→      assert.equal(usage.length, 4);
+   750→    });
+   751→});
+   752→
+   753→test('pure decision checks bind the evaluated model, preserve target checks and never call an LLM', async () => {
+   754→  const input = {
+   755→    userMessages: [{ at: '2026-11-03T09:00:00Z', text: 'Send the report to Ana.' }],
+   756→    action: { name: 'send_email', arguments: { recipient: 'ana@example.test' } },
+   757→  };
+   758→  let served: string | undefined = 'perplexity/pplx-decider-v1.2-20261016';
+   759→  let omit = '';
+   760→  let probabilities: Record<string, number> = {};
+   761→  let source = 'message:0';
+   762→  const events: ProviderUsageEvent[] = [];
+   763→  const model = createDecisionModel({
+   764→    resolve: async () => ({
+   765→      provider: 'openrouter',
+   766→      key: 'synthetic-key',
+   767→      model: 'perplexity/pplx-decider-v1.2',
+   768→    }),
+   769→    fetch: async (_url, init) => {
+   770→      const request = JSON.parse(String(init?.body));
+   771→      assert.equal(Object.keys(request.questions).length, 11);
+   772→      assert.deepEqual(request.state.action, input.action);
+   773→      assert.deepEqual(request.state.userMessages, input.userMessages);
+   774→      assert.equal(request.provider.allow_fallbacks, false);
+   775→      const answers: Record<string, object> = {
+   776→        trust: {
+   777→          type: 'choice',
+   778→          choice: source,
+   779→          probabilities: Object.fromEntries(
+   780→            Object.keys(request.questions.trust.criteria).map((key) => [
+   781→              key,
+   782→              key === source ? 1 : 0,
+   783→            ]),
+   784→          ),
+   785→        },
+   786→      };
+   787→      for (const name of Object.keys(request.questions).slice(1)) {
+   788→        const p = probabilities[name] ?? (['permission', 'scope'].includes(name) ? 0.995 : 0.005);
+   789→        answers[name] = {
+   790→          type: 'choice',
+   791→          choice: String(p >= 0.5),
+   792→          probabilities: { true: p, false: 1 - p },
+   793→        };
+   794→      }
+   795→      delete answers[omit];
+   796→      return Response.json({
+   797→        model: served,
+   798→        answers,
+   799→        usage: { input_tokens: 100, cost: 0.000002 },
+   800→      });
+   801→    },
+   802→  });
+   803→  const review = createTrustReview({
+   804→    decisions: {
+   805→      check: (request, signal) => model.check(request, signal, (event) => events.push(event)),
+   806→    },
+   807→    review: async () => assert.fail('Pure decision mode must never call an LLM.'),
+   808→  });
+   809→  const allowed = () =>
+   810→    review('Apply the permission policy.', input).then((answer) =>
+   811→      trustBasis(answer, withOwnerIds(input, ['message'])),
+   812→    );
+   813→  assert.equal((await allowed())?.kind, 'message');
+   814→  assert.equal(events.length, 1);
+   815→  assert.equal(events[0]?.costUsd, 0.000002);
+   816→  for (const veto of ['targets', 'time', 'numbers', 'conditions', 'constraints', 'bans', 'costs']) {
+   817→    probabilities = { [veto]: 0.99 };
+   818→    assert.equal(await allowed(), undefined);
+   819→  }
+   820→  probabilities = { scope: 0.01 };
+   821→  assert.equal(await allowed(), undefined);
+   822→  probabilities = { permission: 0.995, preparation: 0.995, scope: 0.97, bans: 0.2 };
+   823→  source = 'read';
+   824→  assert.equal((await allowed())?.kind, 'read');
+   825→  input.action.name = 'NOD_sign_in';
+   826→  assert.equal(await allowed(), undefined);
+   827→  input.action.name = 'send_email';
+   828→  source = 'message:0';
+   829→  probabilities = { permission: 0.995, scope: 0.995 };
+   830→  assert.equal((await allowed())?.kind, 'message');
+   831→  probabilities = { permission: 0.93 };
+   832→  assert.equal(await allowed(), undefined);
+   833→  Object.assign(input, { standingInstruction: 'Set the monthly limit to EUR 100.' });
+   834→  source = 'standing';
+   835→  probabilities = { preparation: 0.99 };
+   836→  input.action.name = 'NOD_limits_update';
+   837→  assert.equal(await allowed(), undefined);
+   838→  source = 'message:0';
+   839→  input.action.name = 'send_email';
+   840→  probabilities = {};
+   841→  served = 'perplexity/pplx-decider-v1.3';
+   842→  assert.equal(await allowed(), undefined);
+   843→  served = undefined;
+   844→  assert.equal(await allowed(), undefined);
+   845→  served = 'perplexity/pplx-decider-v1.2-20261016';
+   846→  omit = 'targets';
+   847→  await assert.rejects(allowed());
+   848→  assert.equal(events.at(-1)?.status, 'failed');
+   849→  assert.equal(events.at(-1)?.costUsd, 0.000002);
+   850→  await assert.rejects(review('Apply the permission policy.', input, AbortSignal.abort()));
+   851→});
+   852→
+   853→test('trust calendar facts preserve whole inputs and use the local run date across leap days and DST', () => {
+   854→  const input = {
+   855→    userMessages: [{ at: '2028-02-28T23:30:00Z', text: 'Tomorrow in Madrid.' }],
+   856→    scheduledInstructions: [{ at: '2026-11-14T00:00:00Z', text: 'Send the report tomorrow.' }],
+   857→    scheduledFor: '2028-02-28T23:30:00Z',
+   858→    timeZone: 'Europe/Madrid',
+   859→    action: {
+   860→      name: 'send_email',
+   861→      arguments: { when: '2028-02-29', invalid: '2028-02-30', dst: '2028-03-26T01:30:00Z' },
+   862→    },
+   863→  };
+   864→  const before = JSON.stringify(input);
+   865→  const facts = trustFacts(input);
+   866→  assert.equal(JSON.stringify(input), before);
+   867→  assert.deepEqual(facts.userMessages, input.userMessages);
+   868→  assert.deepEqual(facts.action, input.action);
+   869→  assert.equal(facts.serverDateFacts.scheduleContext?.calendar.date, '2028-02-29');
+   870→  assert.equal(facts.serverDateFacts.scheduleContext?.calendar.tomorrow, '2028-03-01');
+   871→  const args = facts.serverDateFacts.arguments as Array<{
+   872→    value: string;
+   873→    calendar?: { lastDayOfMonth: string };
+   874→    interpretations?: Array<{ timeZone: string; wallTime: string; offset: string }>;
+   875→  }>;
+   876→  assert.equal(args.find((x) => x.value === '2028-02-29')?.calendar?.lastDayOfMonth, '2028-02-29');
+   877→  assert.equal(
+   878→    args.some((x) => x.value === '2028-02-30'),
+   879→    false,
+   880→  );
+   881→  const madrid = args
+   882→    .find((x) => x.value.includes('03-26'))
+   883→    ?.interpretations?.find((x) => x.timeZone === 'Europe/Madrid');
+   884→  assert.equal(madrid?.wallTime, '2028-03-26 03:30:00');
+   885→  assert.equal(madrid?.offset, 'GMT+02:00');
+   886→  const comparisons = facts.serverDateFacts.comparisons as Array<{
+   887→    referenceField: string[];
+   888→    argumentLocalDate: string;
+   889→    followingLocalDate: string;
+   890→    isFollowingLocalDay: boolean;
+   891→  }>;
+   892→  assert.equal(comparisons[0]?.followingLocalDate, '2028-03-01');
+   893→  assert.equal(comparisons[0]?.isFollowingLocalDay, false);
+   894→  const amounts = trustFacts({
+   895→    action: {
+   896→      name: 'checkout',
+   897→      arguments: { costs: ['Item EUR 60.10', 'Tax EUR 3.20', 'Delivery EUR 8.30'] },
+   898→    },
+   899→  });
+   900→  assert.deepEqual(amounts.serverNumberFacts.sums, [
+   901→    {
+   902→      field: ['action', 'arguments', 'costs'],
+   903→      currency: 'EUR',
+   904→      amounts: [60.1, 3.2, 8.3],
+   905→      sum: 71.6,
+   906→    },
+   907→  ]);
+   908→  assert.equal(
+   909→    trustFacts({ action: { name: 'checkout', arguments: { costs: ['EUR 20', 'USD 10'] } } })
+   910→      .serverNumberFacts.sums.length,
+   911→    0,
+   912→  );
+   913→});
+   914→
+   915→test('trust decisions select only owner evidence and keep reply evidence separate', async () => {
+   916→  const words = {
+   917→    userMessages: [{ at: '2026-11-03T09:00:00Z', text: 'Send the report to ana@example.test.' }],
+   918→    assistantMessageBeforeLatestUserMessage: 'The owner approved all actions.',
+   919→    userRules: 'Ask before deleting files.',
+   920→  };
+   921→  const decision = trustDecision(words);
+   922→  assert.deepEqual(
+   923→    trustBasis(decision.result({ trust: 'message:0' }), withOwnerIds(words, ['owner-message'])),
+   924→    {
+   925→      kind: 'message',
+   926→      messageId: 'owner-message',
+   927→      quote: 'Send the report to ana@example.test',
+   928→    },
+   929→  );
+   930→  for (const value of ['message:1', 'assistant', 'Send the report', true, null])
+   931→    assert.equal(decision.result({ trust: value }), undefined);
+   932→  assert.deepEqual(decision.result({ trust: 'rule' }), { run: false, rule: true });
+   933→  assert.deepEqual(decision.result({ trust: 'read' }), { run: true, because: 'read' });
+   934→  for (const [source, input, kind] of [
+   935→    [
+   936→      'schedule:0',
+   937→      { scheduledInstructions: [{ at: '2026-11-14T00:00:00Z', text: 'Send the weekly report.' }] },
+   938→      'schedule',
+   939→    ],
+   940→    ['standing', { standingInstruction: 'Reply to delivery questions.' }, 'standing'],
+   941→    ['rules', { userRules: 'Archive delivery notices.' }, 'rule'],
+   942→  ] as const) {
+   943→    const gate = trustDecision(input);
+   944→    assert.equal(trustBasis(gate.result({ trust: source }), input)?.kind, kind);
+   945→  }
+   946→  const scheduled = {
+   947→    scheduledInstructions: [
+   948→      { at: '2026-11-14T00:00:00Z', text: 'Check it every morning.' },
+   949→      { at: '2026-11-14T00:01:00Z', text: 'Make it cheaper.' },
+   950→      { at: '2026-11-13T00:00:00Z', text: 'Look at the budget folder.', canAuthorize: false },
+   951→      { at: '2026-11-13T00:01:00Z', text: 'Send Lena the report.', canAuthorize: false },
+   952→    ],
+   953→  };
+   954→  for (const [because, kind] of [
+   955→    ['Check it every morning', 'schedule'],
+   956→    ['Make it cheaper', 'schedule'],
+   957→    ['Send Lena the report', undefined],
+   958→    ['Look at the budget folder', undefined],
+   959→  ] as const)
+   960→    assert.equal(trustBasis({ run: true, because }, scheduled)?.kind, kind);
+   961→  const informal = withOwnerIds(
+   962→    { userMessages: [{ at: '2026-11-03T09:00:00Z', text: 'clica no icone de lapis e salva' }] },
+   963→    ['owner-message'],
+   964→  );
+   965→  for (const [because, kind] of [
+   966→    ['…clica no icone de lapis', 'message'],
+   967→    ['clica no ícone de lápis', 'message'],
+   968→    ['clica no ícone … salva', undefined],
+   969→    ['apaga o ícone', undefined],
+   970→  ] as const)
+   971→    assert.equal(trustBasis({ run: true, because }, informal)?.kind, kind, because);
+   972→  const conditional = withOwnerIds(
+   973→    { userMessages: [{ at: '2026-11-03T09:00:00Z', text: 'send it if x ≠ 1' }] },
+   974→    ['owner-message'],
+   975→  );
+   976→  for (const [because, kind] of [
+   977→    ['send it if x ≠ 1', 'message'],
+   978→    ['send it if x = 1', undefined],
+   979→  ] as const)
+   980→    assert.equal(trustBasis({ run: true, because }, conditional)?.kind, kind, because);
+   981→  const recipient = withOwnerIds(
+   982→    {
+   983→      userMessages: [
+   984→        {
+   985→          at: '2026-11-03T09:00:00Z',
+   986→          text: 'manda o relatorio para lena@example.test e publica em docs.example.test/relatorio',
+   987→        },
+   988→        { at: '2026-11-03T09:01:00Z', text: 'avisa cafe.example.test, ação:sim' },
+   989→      ],
+   990→    },
+   991→    ['owner-message', 'owner-reply'],
+   992→  );
+   993→  for (const [because, kind] of [
+   994→    ['manda o relatório para lena@example.test', 'message'],
+   995→    ['manda o relatorio para lena@exämple.test', undefined],
+   996→    ['publica em docs.exämple.test/relatorio', undefined],
+   997→    ['avisa café.example.test', undefined],
+   998→    ['acao:sim', 'message'],
+   999→  ] as const)
+  1000→    assert.equal(trustBasis({ run: true, because }, recipient)?.kind, kind, because);
+  1001→  assert.equal(
+  1002→    trustDecision(scheduled).question.choices.some(({ value }) =>
+  1003→      String(value).startsWith('message:'),
+  1004→    ),
+  1005→    false,
+  1006→  );
+  1007→  let output: unknown = { readOnly: true };
+  1008→  let currentRules: string | undefined = words.userRules;
+  1009→  let holdReview = false;
+  1010→  let reviewStarted: () => void = () => {};
+  1011→  let releaseReview: () => void = () => {};
+  1012→  let started = Promise.resolve();
+  1013→  let released = Promise.resolve();
+  1014→  const seen: object[] = [];
+  1015→  const trust = createTrust({
+  1016→    pool: { query: async () => ({ rows: [{ rules: currentRules }] }) } as never,
+  1017→    ownerId: 'synthetic-owner',
+  1018→    review: async () => assert.fail('A decision check must not switch to an LLM.'),
+  1019→    decisions: {
+  1020→      check: async ({ input, question }) => {
+  1021→        seen.push(input);
+  1022→        assert.equal(question.minProbability, 0.99);
+  1023→        if (output instanceof Error) throw output;
+  1024→        if (holdReview) {
+  1025→          reviewStarted();
+  1026→          await released;
+  1027→        }
+  1028→        return output && typeof output === 'object' ? { probability: 1, ...output } : output;
+  1029→      },
+  1030→    },
+  1031→  });
+  1032→  const read = () => trust.readOnly('records_list', {}, {}, AbortSignal.timeout(1000));
+  1033→  assert.equal(await read(), true);
+  1034→  assert.deepEqual(seen.at(-1), {
+  1035→    action: { name: 'records_list', arguments: {}, schema: {} },
+  1036→    userRules: words.userRules,
+  1037→  });
+  1038→  for (const value of [
+  1039→    undefined,
+  1040→    {},
+  1041→    { run: true },
+  1042→    { readOnly: 'true' },
+  1043→    new Error('Synthetic outage.'),
+  1044→  ]) {
+  1045→    output = value;
+  1046→    assert.equal(await read(), false);
+  1047→  }
+  1048→  output = { readOnly: true };
+  1049→  holdReview = true;
+  1050→  started = new Promise<void>((resolve) => (reviewStarted = resolve));
+  1051→  released = new Promise<void>((resolve) => (releaseReview = resolve));
+  1052→  const pendingRead = read();
+  1053→  await started;
+  1054→  currentRules = 'Ask before every connected-account read.';
+  1055→  releaseReview();
+  1056→  assert.equal(await pendingRead, false);
+  1057→  holdReview = false;
+  1058→  currentRules = words.userRules;
+  1059→  assert.equal(await read(), true);
+  1060→  holdReview = true;
+  1061→  currentRules = undefined;
+  1062→  started = new Promise<void>((resolve) => (reviewStarted = resolve));
+  1063→  released = new Promise<void>((resolve) => (releaseReview = resolve));
+  1064→  const emptyRowRead = read();
+  1065→  await started;
+  1066→  currentRules = '';
+  1067→  releaseReview();
+  1068→  assert.equal(await emptyRowRead, true);
+  1069→  holdReview = false;
+  1070→  for (const [answer, expected] of [
+  1071→    ['yes', true],
+  1072→    ['no', false],
+  1073→    ['other', undefined],
+  1074→  ] as const) {
+  1075→    output = { answer };
+  1076→    assert.equal(await trust.answer('Yes, if the price stays below EUR 20.'), expected);
+  1077→    assert.deepEqual(seen.at(-1), { reply: 'Yes, if the price stays below EUR 20.' });
+  1078→  }
+  1079→  output = new Error('Synthetic outage.');
+  1080→  await assert.rejects(trust.answer('Yes'));
+  1081→});
+  1082→
+  1083→test('retired confirmation replies require high confidence to start a new request', async () => {
+  1084→  let output: unknown;
+  1085→  const reply = 'Yes, move the reminder to tomorrow.';
+  1086→  const expiredConfirmation = 'Cancel the reminder?';
+  1087→  const trust = createTrust({
+  1088→    pool: {} as never,
+  1089→    ownerId: 'synthetic-owner',
+  1090→    review: async (_instructions, input, _signal, question) => {
+  1091→      assert.deepEqual(input, { reply, expiredConfirmation });
+  1092→      assert.equal(question?.name, 'retiredReply');
+  1093→      assert.deepEqual(
+  1094→        question?.choices.map(({ value }) => value),
+  1095→        ['new', 'stale'],
+  1096→      );
+  1097→      return output;
+  1098→    },
+  1099→  });
+  1100→  for (const [answer, expected] of [
+  1101→    [{ retiredReply: 'new', probability: 0.98 }, 'uncertain'],
+  1102→    [{ retiredReply: 'new', probability: '0.995' }, 'uncertain'],
+  1103→    [{ retiredReply: 'new', probability: Number.NaN }, 'uncertain'],
+  1104→    [{ retiredReply: 'new', probability: 1.1 }, 'uncertain'],
+  1105→    [{ retiredReply: 'new' }, 'uncertain'],
+  1106→    [{ retiredReply: 'new', probability: 0.995 }, 'new'],
+  1107→    [{ retiredReply: 'stale', probability: 0.8 }, 'uncertain'],
+  1108→    [{ retiredReply: 'stale' }, 'uncertain'],
+  1109→    [{ retiredReply: 'stale', probability: 0.995 }, 'stale'],
+  1110→  ] as const) {
+  1111→    output = answer;
+  1112→    assert.equal(await trust.classifyRetiredReply(reply, expiredConfirmation), expected);
+  1113→  }
+  1114→});
+  1115→
+  1116→test('native decision probabilities validate the wire type and retain refusal and cache costs', async (t) => {
+  1117→  for (const provider of ['openai', 'typesafe', 'openrouter'] as const)
+  1118→    await t.test(provider, async () => {
+  1119→      let invalid = false;
+  1120→      let refused = false;
+  1121→      let requests = 0;
+  1122→      const events: ProviderUsageEvent[] = [];
+  1123→      const model = createDecisionModel({
+  1124→        resolve: async () => ({ provider, key: 'synthetic-native-key' }),
+  1125→        fetch: async (_url, init) => {
+  1126→          requests++;
+  1127→          const body = JSON.parse(String(init?.body));
+  1128→          const wire = provider === 'openai' ? body.questions[0] : body.questions.permission;
+  1129→          assert.equal(wire.type, provider === 'openai' ? 'predicate' : 'noul');
+  1130→          assert.equal(wire.choices, undefined);
+  1131→          assert.equal(wire.criteria, undefined);
+  1132→          const answer = refused
+  1133→            ? { type: 'refusal' }
+  1134→            : invalid
+  1135→              ? { type: 'choice', choice: provider === 'openai' ? true : 'true' }
+  1136→              : provider === 'openai'
+  1137→                ? { type: 'predicate', probability: 0.83 }
+  1138→                : { type: 'noul', noul: 0.83 };
+  1139→          return Response.json({
+  1140→            answers:
+  1141→              provider === 'openai' ? [{ ...answer, name: 'permission' }] : { permission: answer },
+  1142→            usage: {
+  1143→              input_tokens: 1000,
+  1144→              input_tokens_details: { cached_tokens: 400, cache_write_tokens: 200 },
+  1145→            },
+  1146→          });
+  1147→        },
+  1148→      });
+  1149→      const question: DecisionQuestion = {
+  1150→        name: 'permission',
+  1151→        format: 'predicate',
+  1152→        minProbability: 0.9,
+  1153→        uncertainValue: false,
+  1154→        choices: [
+  1155→          { value: true, description: 'Allowed.' },
+  1156→          { value: false, description: 'Ask.' },
+  1157→        ],
+  1158→      };
+  1159→      const request = { instructions: 'Synthetic policy.', input: {}, question };
+  1160→      assert.deepEqual(await model.check(request, undefined, (event) => events.push(event)), {
+  1161→        permission: false,
+  1162→        choice: true,
+  1163→        probability: 0.83,
+  1164→      });
+  1165→      if (provider === 'openai') {
+  1166→        assert.equal(events[0]?.inputTokens, 400);
+  1167→        assert.equal(events[0]?.cacheReadTokens, 400);
+  1168→        assert.equal(events[0]?.cacheWriteTokens, 200);
+  1169→        assert.ok(Math.abs(events[0]!.costUsd! - 0.000069) < 1e-12);
+  1170→      }
+  1171→      invalid = true;
+  1172→      await assert.rejects(model.check(request));
+  1173→      invalid = false;
+  1174→      refused = true;
+  1175→      const review = createTrustReview({
+  1176→        decisions: model,
+  1177→        review: async () => assert.fail('A refusal must not start an LLM request.'),
+  1178→      });
+  1179→      assert.equal(await review('', {}, undefined, question), undefined);
+  1180→      const before = requests;
+  1181→      await assert.rejects(
+  1182→        model.check({
+  1183→          ...request,
+  1184→          forModel: (selection) => {
+  1185→            assert.equal(selection.provider, provider);
+  1186→            assert.equal('key' in selection, false);
+  1187→            throw new Error('The model changed.');
+  1188→          },
+  1189→        }),
+  1190→      );
+  1191→      assert.equal(requests, before);
+  1192→      await assert.rejects(model.check({ ...request, question: { ...question, choices: [] } }));
+  1193→      assert.equal(requests, before);
+  1194→    });
+  1195→});
+  1196→
+  1197→test('decision gates validate the complete probability distribution before allowing work', async (t) => {
+  1198→  for (const provider of ['openai', 'typesafe', 'openrouter'] as const)
+  1199→    await t.test(provider, async () => {
+  1200→      let probabilities: unknown = { allow: 0.995, ask: 0.005 };
+  1201→      let choice = 'allow';
+  1202→      let calls = 0;
+  1203→      const usage: ProviderUsageEvent[] = [];
+  1204→      const model = createDecisionModel({
+  1205→        resolve: async () => ({ provider, key: 'synthetic-decision-key' }),
+  1206→        fetch: async (_url, init) => {
+  1207→          calls++;
+  1208→          const body = JSON.parse(String(init?.body));
+  1209→          if (provider === 'openrouter')
+  1210→            assert.deepEqual(body.provider, { allow_fallbacks: false });
+  1211→          const answer = {
+  1212→            type: 'choice',
+  1213→            choice,
+  1214→            probabilities:
+  1215→              provider === 'openai' &&
+  1216→              probabilities &&
+  1217→              typeof probabilities === 'object' &&
+  1218→              !Array.isArray(probabilities)
+  1219→                ? Object.entries(probabilities).map(([value, probability]) => ({
+  1220→                    value,
+  1221→                    probability,
+  1222→                  }))
+  1223→                : probabilities,
+  1224→          };
+  1225→          return Response.json({
+  1226→            answers: provider === 'openai' ? [{ ...answer, name: 'trust' }] : { trust: answer },
+  1227→            usage: { input_tokens: 100, cost: 0.00001 },
+  1228→          });
+  1229→        },
+  1230→      });
+  1231→      const check = () =>
+  1232→        model.check(
+  1233→          {
+  1234→            instructions: 'Apply the permission policy.',
+  1235→            input: {},
+  1236→            question: {
+  1237→              name: 'trust',
+  1238→              minProbability: 0.99,
+  1239→              choices: [
+  1240→                { value: 'allow', description: 'Allowed.' },
+  1241→                { value: 'ask', description: 'Ask.' },
+  1242→              ],
+  1243→            },
+  1244→          },
+  1245→          undefined,
+  1246→          (event) => usage.push(event),
+  1247→        );
+  1248→      assert.deepEqual(await check(), {
+  1249→        trust: 'allow',
+  1250→        choice: 'allow',
+  1251→        probability: 0.995,
+  1252→        probabilities: { allow: 0.995, ask: 0.005 },
+  1253→      });
+  1254→      probabilities = { allow: 0.98, ask: 0.02 };
+  1255→      assert.deepEqual(await check(), {
+  1256→        trust: undefined,
+  1257→        choice: 'allow',
+  1258→        probability: 0.98,
+  1259→        probabilities: { allow: 0.98, ask: 0.02 },
+  1260→      });
+  1261→      assert.equal(usage.at(-1)?.status, 'succeeded');
+  1262→      for (const invalid of [
+  1263→        undefined,
+  1264→        { allow: 1 },
+  1265→        { allow: 1, ask: 0, extra: 0 },
+  1266→        { allow: 0.99, ask: 0.99 },
+  1267→        { allow: 1.1, ask: -0.1 },
+  1268→        { allow: '0.99', ask: 0.01 },
+  1269→        [
+  1270→          { value: 'allow', probability: 1 },
+  1271→          { value: 'allow', probability: 0 },
+  1272→        ],
+  1273→      ]) {
+  1274→        probabilities = invalid;
+  1275→        await assert.rejects(check(), /could not complete/);
+  1276→        assert.equal(usage.at(-1)?.status, 'failed');
+  1277→        assert.equal(usage.at(-1)?.inputTokens, 100);
+  1278→      }
+  1279→      probabilities = { allow: 0.01, ask: 0.99 };
+  1280→      await assert.rejects(check());
+  1281→      choice = 'ask';
+  1282→      assert.deepEqual(await check(), {
+  1283→        trust: 'ask',
+  1284→        choice: 'ask',
+  1285→        probability: 0.99,
+  1286→        probabilities: { allow: 0.01, ask: 0.99 },
+  1287→      });
+  1288→      assert.equal(calls, usage.length);
+  1289→      await assert.rejects(
+  1290→        model.check(
+  1291→          { instructions: '', input: {}, question: { name: 'trust', choices: [] } },
+  1292→          AbortSignal.abort(),
+  1293→        ),
+  1294→      );
+  1295→      assert.equal(calls, usage.length);
+  1296→    });
+  1297→});
+  1298→
+  1299→test('unavailable decisions avoid ledger reads and retain dynamic availability and spending limits', async () => {
+  1300→  let configured = false;
+  1301→  let availabilityReads = 0;
+  1302→  let curatorRequests = 0;
+  1303→  let spent = 0;
+  1304→  let reads = 0;
+  1305→  let writes = 0;
+  1306→  let resolutions = 0;
+  1307→  let requests = 0;
+  1308→  const ledger = createLedger({
+  1309→    pool: {
+  1310→      async query(sql: string) {
+  1311→        if (sql.startsWith('SELECT monthly_usd')) {
+  1312→          reads++;
+  1313→          return { rows: [{ monthly_usd: 1, task_usd: null, spent }] };
+  1314→        }
+  1315→        assert.match(sql, /INSERT INTO model_usage/);
+  1316→        writes++;
+  1317→        return { rows: [] };
+  1318→      },
+  1319→    } as never,
+  1320→    ownerId: 'synthetic-decision-owner',
+  1321→  });
+  1322→  const model = createDecisionModel({
+  1323→    configured: () => {
+  1324→      availabilityReads++;
+  1325→      return configured;
+  1326→    },
+  1327→    resolve: async () => {
+  1328→      resolutions++;
+  1329→      return { provider: 'openai', key: 'synthetic-decision-key' };
+  1330→    },
+  1331→    fetch: async () => {
+  1332→      requests++;
+  1333→      return Response.json({
+  1334→        answers: [{ type: 'choice', name: 'access', choice: false }],
+  1335→        usage: { input_tokens: 5, output_tokens: 1 },
+  1336→      });
+  1337→    },
+  1338→  });
+  1339→  const decision = ledger.decisions(model);
+  1340→  const checkMail = createMailCheck({
+  1341→    decisions: decision,
+  1342→    curator: {
+  1343→      id: 'synthetic-curator',
+  1344→      configured: true,
+  1345→      async curate({ input }) {
+  1346→        curatorRequests++;
+  1347→        assert.deepEqual(Object.keys(input), ['email']);
+  1348→        return { access: false };
+  1349→      },
+  1350→    },
+  1351→  });
+  1352→  const request = {
+  1353→    instructions: 'Check this synthetic email.',
+  1354→    input: { email: { from: 'shop@example.test', subject: 'Receipt', text: 'Order dispatched.' } },
+  1355→    question: {
+  1356→      name: 'access',
+  1357→      choices: [
+  1358→        { value: false, description: 'Ordinary mail' },
+  1359→        { value: true, description: 'Account access' },
+  1360→      ],
+  1361→    } satisfies DecisionQuestion,
+  1362→  };
+  1363→  assert.equal(decision.configured, false);
+  1364→  assert.deepEqual(
+  1365→    await Promise.all(Array.from({ length: 100 }, () => decision.check(request))),
+  1366→    Array.from({ length: 100 }),
+  1367→  );
+  1368→  assert.deepEqual(
+  1369→    { reads, writes, resolutions, requests },
+  1370→    { reads: 0, writes: 0, resolutions: 0, requests: 0 },
+  1371→  );
+  1372→  await assert.rejects(decision.check(request, AbortSignal.abort()));
+  1373→  assert.equal(reads, 0);
+  1374→  const beforeAvailability = availabilityReads;
+  1375→  const emails = Array.from({ length: 100 }, () => request.input.email);
+  1376→  assert.deepEqual(await checkMail(emails), Array<boolean>(100).fill(false));
+  1377→  assert.equal(availabilityReads - beforeAvailability, 1);
+  1378→  assert.equal(curatorRequests, 100);
+  1379→  assert.deepEqual(
+  1380→    { reads, writes, resolutions, requests },
+  1381→    { reads: 0, writes: 0, resolutions: 0, requests: 0 },
+  1382→  );
+  1383→  assert.deepEqual(
+  1384→    await checkMail(emails, AbortSignal.abort()),
+  1385→    Array<string>(100).fill('the read was stopped before its check finished'),
+  1386→  );
+  1387→  assert.equal(availabilityReads - beforeAvailability, 1);
+  1388→  assert.equal(curatorRequests, 100);
+  1389→
+  1390→  configured = true;
+  1391→  assert.equal(decision.configured, true);
+  1392→  assert.deepEqual(await checkMail([request.input.email]), [false]);
+  1393→  assert.deepEqual(
+  1394→    { reads, writes, resolutions, requests },
+  1395→    { reads: 1, writes: 1, resolutions: 1, requests: 1 },
+  1396→  );
+  1397→  spent = 1;
+  1398→  assert.deepEqual(await checkMail([request.input.email]), [
+  1399→    'This month’s spending limit is reached.',
+  1400→  ]);
+  1401→  assert.equal(curatorRequests, 100);
+  1402→  assert.deepEqual(
+  1403→    { reads, writes, resolutions, requests },
+  1404→    { reads: 2, writes: 1, resolutions: 1, requests: 1 },
+  1405→  );
+  1406→
+  1407→  configured = false;
+  1408→  assert.equal(await decision.check(request), undefined);
+  1409→  assert.equal(reads, 2);
+  1410→  spent = 0;
+  1411→  const unknown = ledger.decisions(
+  1412→    createDecisionModel({
+  1413→      resolve: async () => {
+  1414→        resolutions++;
+  1415→        throw new Error('Synthetic connection is unreadable.');
+  1416→      },
+  1417→    }),
+  1418→  );
+  1419→  await assert.rejects(unknown.check(request), /connection is unreadable/);
+  1420→  assert.equal(reads, 3);
+  1421→  assert.equal(resolutions, 2);
+  1422→  assert.equal(requests, 1);
+  1423→  configured = true;
+  1424→  const selected = await decision.select!();
+  1425→  assert.equal(resolutions, 3);
+  1426→  const beforeWrites = writes;
+  1427→  await selected!.check(request);
+  1428→  await selected!.check(request);
+  1429→  assert.equal(resolutions, 3);
+  1430→  assert.equal(requests, 3);
+  1431→  assert.equal(writes, beforeWrites + 2);
+  1432→});
+  1433→
+  1434→test('decision requests revalidate capability and cancellation after resolving credentials', async (t) => {
+  1435→  for (const stop of ['configuration', 'cancel'] as const)
+  1436→    await t.test(stop, async () => {
+  1437→      const provider: DecisionConnection['provider'] = 'openai';
+  1438→      let configured = true;
+  1439→      let calls = 0;
+  1440→      let fallback = 0;
+  1441→      let release: () => void = () => {};
+  1442→      let entered: () => void = () => {};
+  1443→      const pending = new Promise<void>((resolve) => {
+  1444→        release = resolve;
+  1445→      });
+  1446→      const resolving = new Promise<void>((resolve) => {
+  1447→        entered = resolve;
+  1448→      });
+  1449→      const model = createDecisionModel({
+  1450→        configured: () => configured,
+  1451→        resolve: async () => {
+  1452→          const selected = provider;
+  1453→          entered();
+  1454→          await pending;
+  1455→          return { provider: selected, key: 'synthetic-old-connection' };
+  1456→        },
+  1457→        fetch: async () => {
+  1458→          calls++;
+  1459→          return Response.json({
+  1460→            answers: [{ name: 'access_0', type: 'choice', choice: false }],
+  1461→            usage: { input_tokens: 1 },
+  1462→          });
+  1463→        },
+  1464→      });
+  1465→      const check = createMailCheck({
+  1466→        decisions: {
+  1467→          check: model.check,
+  1468→        },
+  1469→        curator: {
+  1470→          id: 'synthetic',
+  1471→          configured: true,
+  1472→          curate: async () => {
+  1473→            fallback++;
+  1474→            return { access: false };
+  1475→          },
+  1476→        },
+  1477→      });
+  1478→      const controller = new AbortController();
+  1479→      const result = check(
+  1480→        [{ from: 'fixture@example.test', subject: 'Receipt', text: 'Order dispatched.' }],
+  1481→        controller.signal,
+  1482→      );
+  1483→      await resolving;
+  1484→      if (stop === 'configuration') configured = false;
+  1485→      if (stop === 'cancel') controller.abort();
+  1486→      release();
+  1487→      assert.deepEqual(await result, [
+  1488→        stop === 'cancel'
+  1489→          ? 'the read was stopped before its check finished'
+  1490→          : 'the check model gave no valid answer',
+  1491→      ]);
+  1492→      await new Promise((resolve) => setImmediate(resolve));
+  1493→      assert.equal(calls, 0);
+  1494→      assert.equal(fallback, 0);
+  1495→    });
+  1496→});
+  1497→
+  1498→describe('account routes', () => {
+  1499→  const origin = 'http://localhost:4399';
+  1500→  async function fixture(
+  1501→    analytics?: Analytics,
+  1502→    onTraces?: (enabled: boolean) => void,
+  1503→    key?: string,
+  1504→    onboardingMissing?: () => Promise<'brain' | 'email' | null>,
+  1505→    model?: Parameters<typeof createAccountSession>[0]['model'],
+  1506→  ) {
+  1507→    let record: AccountSettings = {
+  1508→      theme: 'system',
+  1509→      onboardingCompleted: false,
+  1510→      usageData: false,
+  1511→      traces: false,
+  1512→    };
+  1513→    let usageRevision = 0;
+  1514→    const calls = { writes: 0, started: 0 };
+  1515→    const activity = { days: 0, reads: 0, wait: undefined as (() => Promise<void>) | undefined };
+  1516→    const accounts: AccountStore = {
+  1517→      async readConsent() {
+  1518→        return { enabled: record.usageData, revision: String(usageRevision) };
+  1519→      },
+  1520→      async read() {
+  1521→        return record;
+  1522→      },
+  1523→      async activeDays(owner, limit) {
+  1524→        activity.reads++;
+  1525→        await activity.wait?.();
+  1526→        return owner === 'local-owner' ? Math.min(activity.days, limit) : 0;
+  1527→      },
+  1528→      async seenSurveys() {
+  1529→        return [];
+  1530→      },
+  1531→      async markSurveySeen() {},
+  1532→      async update(_owner, input) {
+  1533→        calls.writes++;
+  1534→        const saved = record;
+  1535→        if (input.usageData !== undefined && input.usageData !== saved.usageData) usageRevision++;
+  1536→        record = {
+  1537→          theme: input.theme ?? saved.theme,
+  1538→          onboardingCompleted: input.onboardingCompleted ?? saved.onboardingCompleted,
+  1539→          usageData: input.usageData ?? saved.usageData,
+  1540→          traces: input.traces ?? saved.traces,
+  1541→        };
+  1542→        return {
+  1543→          ...record,
+  1544→          onboardingCompletedNow: record.onboardingCompleted && !saved.onboardingCompleted,
+  1545→        };
+  1546→      },
+  1547→    };
+  1548→    const app = Fastify();
+  1549→    if (key) registerLocalAccess(app, 4399, { key });
+  1550→    app.setErrorHandler((_error, _request, reply) =>
+  1551→      reply.code(400).send({ error: 'Invalid account request.' }),
+  1552→    );
+  1553→    createAccountSession({
+  1554→      analytics,
+  1555→      accounts,
+  1556→      origin,
+  1557→      localUser: { id: 'local-owner', name: 'You', email: null, avatarUrl: null },
+  1558→      developerIds: new Set(['local-owner']),
+  1559→      async start() {
+  1560→        calls.started++;
+  1561→      },
+  1562→      traces: onTraces !== undefined,
+  1563→      onTraces,
+  1564→      onboardingMissing,
+  1565→      model,
+  1566→    }).register(app);
+  1567→    await app.ready();
+  1568→    return { app, calls, activity, record: () => record };
+  1569→  }
+  1570→
+  1571→  test('first completion requires setup readiness without rechecking a completed profile', async (t) => {
+  1572→    let ready = false;
+  1573→    let failed = false;
+  1574→    let checked = 0;
+  1575→    const f = await fixture(undefined, undefined, undefined, async () => {
+  1576→      checked++;
+  1577→      if (failed) throw new Error('Synthetic provider outage');
+  1578→      return ready ? null : 'email';
+  1579→    });
+  1580→    t.after(() => f.app.close());
+  1581→    const complete = () =>
+  1582→      f.app.inject({
+  1583→        method: 'PATCH',
+  1584→        url: '/api/account',
+  1585→        headers: { origin },
+  1586→        payload: { onboardingCompleted: true },
+  1587→      });
+  1588→    const refused = await complete();
+  1589→    assert.equal(refused.statusCode, 409);
+  1590→    assert.equal(refused.json().step, 'email');
+  1591→    assert.equal(f.record().onboardingCompleted, false);
+  1592→    assert.equal(f.calls.writes, 0);
+  1593→    assert.equal(f.calls.started, 0);
+  1594→    failed = true;
+  1595→    assert.equal((await complete()).statusCode, 503);
+  1596→    assert.equal(f.record().onboardingCompleted, false);
+  1597→    failed = false;
+  1598→    ready = true;
+  1599→    assert.equal((await complete()).statusCode, 200);
+  1600→    assert.equal(f.record().onboardingCompleted, true);
+  1601→    const checks = checked;
+  1602→    ready = false;
+  1603→    assert.equal((await complete()).statusCode, 200);
+  1604→    assert.equal(checked, checks);
+  1605→    const reopened = await f.app.inject({
+  1606→      method: 'PATCH',
+  1607→      url: '/api/account',
+  1608→      headers: { origin },
+  1609→      payload: { onboardingCompleted: false },
+  1610→    });
+  1611→    assert.ok(reopened.statusCode >= 400);
+  1612→    assert.equal(f.record().onboardingCompleted, true);
+  1613→  });
+  1614→
+  1615→  test('usage data stays off until the owner opts in and the environment switch always wins', async (t) => {
+  1616→    for (const available of [true, false]) {
+  1617→      const captured: Parameters<ProductAnalytics['capture']>[0][] = [];
+  1618→      const installationId = randomUUID();
+  1619→      const analytics = await createAnalytics({
+  1620→        provider: available
+  1621→          ? { capture: (event) => captured.push(event), shutdown: async () => {} }
+  1622→          : undefined,
+  1623→        environment: 'production',
+  1624→        dataRoot: '.',
+  1625→        installationId,
+  1626→      });
+  1627→      const f = await fixture(analytics);
+  1628→      f.activity.days = 3;
+  1629→      t.after(() => f.app.close());
+  1630→      const request = (payload?: object) =>
+  1631→        f.app.inject({
+  1632→          method: payload ? 'PATCH' : 'GET',
+  1633→          url: payload ? '/api/account' : '/api/session',
+  1634→          headers: { origin },
+  1635→          ...(payload ? { payload } : {}),
+  1636→        });
+  1637→      const initial = await request();
+  1638→      assert.equal(initial.json().settings.usageData, false);
+  1639→      assert.equal(initial.json().settings.usageDataRevision, '0');
+  1640→      assert.equal(initial.json().capabilities.traces, false);
+  1641→      assert.deepEqual(
+  1642→        [initial.json().analytics.enabled, initial.json().analytics.distinctId],
+  1643→        [false, null],
+  1644→      );
+  1645→      assert.notEqual(initial.json().analytics.surveys, true);
+  1646→      assert.equal(f.activity.reads, 0);
+  1647→      await request({ onboardingCompleted: true });
+  1648→      assert.equal(f.calls.started, 1);
+  1649→      analytics.capture('local-owner', { event: 'conversation_reset' });
+  1650→      assert.equal(captured.length, 0);
+  1651→      const opted = await request({ usageData: true });
+  1652→      assert.equal(opted.statusCode, 200);
+  1653→      assert.equal(opted.json().user.name, 'You');
+  1654→      assert.equal(opted.json().settings.usageData, true);
+  1655→      assert.equal(opted.json().settings.usageDataRevision, '1');
+  1656→      assert.equal(opted.json().analytics.enabled, available);
+  1657→      assert.equal(opted.json().analytics.surveys, available ? true : undefined);
+  1658→      assert.equal(f.activity.reads, available ? 1 : 0);
+  1659→      assert.equal(f.record().usageData, true);
+  1660→      await request({ theme: 'dark' });
+  1661→      analytics.forOwner('local-owner')({ event: 'chat_stopped' });
+  1662→      assert.deepEqual(
+  1663→        captured
+  1664→          .filter(({ event }) => event === 'setting_changed')
+  1665→          .map(({ properties }) => ({
+  1666→            setting: properties.setting,
+  1667→            actor: properties.actor,
+  1668→            state: properties.state,
+  1669→          })),
+  1670→        available
+  1671→          ? [
+  1672→              { setting: 'usage_data', actor: 'owner', state: 'on' },
+  1673→              { setting: 'theme', actor: 'owner', state: 'dark' },
+  1674→            ]
+  1675→          : [],
+  1676→      );
+  1677→      assert.deepEqual(
+  1678→        captured.map((event) => [event.distinctId, event.event]),
+  1679→        available
+  1680→          ? [
+  1681→              [`local:${installationId}`, 'setting_changed'],
+  1682→              [`local:${installationId}`, 'setting_changed'],
+  1683→              [`local:${installationId}`, 'settings_updated'],
+  1684→              [`local:${installationId}`, 'chat_stopped'],
+  1685→            ]
+  1686→          : [],
+  1687→      );
+  1688→      const reads = f.activity.reads;
+  1689→      const declined = await request({ usageData: false });
+  1690→      assert.equal(declined.json().analytics.enabled, false);
+  1691→      assert.equal(declined.json().settings.usageDataRevision, '2');
+  1692→      assert.notEqual(declined.json().analytics.surveys, true);
+  1693→      assert.equal(f.activity.reads, reads);
+  1694→      analytics.capture('local-owner', { event: 'chat_stopped' });
+  1695→      assert.equal(captured.length, available ? 4 : 0);
+  1696→    }
+  1697→  });
+  1698→
+  1699→  test('surveys require three active days and do not outlive an opt-out during eligibility lookup', async (t) => {
+  1700→    const analytics = await createAnalytics({
+  1701→      provider: { capture() {}, shutdown: async () => {} },
+  1702→      environment: 'development',
+  1703→      dataRoot: '.',
+  1704→      installationId: randomUUID(),
+  1705→    });
+  1706→    t.after(() => analytics.shutdown());
+  1707→    const f = await fixture(analytics);
+  1708→    t.after(() => f.app.close());
+  1709→    const request = (payload?: object) =>
+  1710→      f.app.inject({
+  1711→        method: payload ? 'PATCH' : 'GET',
+  1712→        url: payload ? '/api/account' : '/api/session',
+  1713→        headers: { origin },
+  1714→        ...(payload ? { payload } : {}),
+  1715→      });
+  1716→    assert.equal((await request({ usageData: true })).statusCode, 200);
+  1717→    for (const [days, eligible] of [
+  1718→      [0, false],
+  1719→      [2, false],
+  1720→      [3, true],
+  1721→      [4, true],
+  1722→    ] as const) {
+  1723→      f.activity.days = days;
+  1724→      const response = await request();
+  1725→      assert.equal(response.statusCode, 200);
+  1726→      assert.equal(response.json().analytics.surveys, eligible);
+  1727→    }
+  1728→    let entered!: () => void;
+  1729→    let release!: () => void;
+  1730→    const started = new Promise<void>((resolve) => {
+  1731→      entered = resolve;
+  1732→    });
+  1733→    const blocked = new Promise<void>((resolve) => {
+  1734→      release = resolve;
+  1735→    });
+  1736→    f.activity.wait = async () => {
+  1737→      entered();
+  1738→      await blocked;
+  1739→    };
+  1740→    const pending = request().then((response) => response);
+  1741→    await started;
+  1742→    assert.equal((await request({ usageData: false })).statusCode, 200);
+  1743→    release();
+  1744→    const response = await pending;
+  1745→    assert.equal(response.statusCode, 200);
+  1746→    assert.equal(response.json().settings.usageData, false);
+  1747→    assert.equal(response.json().analytics.enabled, false);
+  1748→    assert.equal(response.json().analytics.distinctId, null);
+  1749→    assert.notEqual(response.json().analytics.surveys, true);
+  1750→  });
+  1751→
+  1752→  test('onboarding analytics report only the selected bounded provider', async (t) => {
+  1753→    for (const [provider, expected] of [
+  1754→      ['anthropic', 'anthropic'],
+  1755→      ['compatible', 'compatible'],
+  1756→      ['PRIVATE_PROVIDER_CANARY', 'other'],
+  1757→    ]) {
+  1758→      const captured: Parameters<ProductAnalytics['capture']>[0][] = [];
+  1759→      const analytics = await createAnalytics({
+  1760→        provider: { capture: (event) => captured.push(event), shutdown: async () => {} },
+  1761→        environment: 'development',
+  1762→        dataRoot: '.',
+  1763→        installationId: randomUUID(),
+  1764→      });
+  1765→      t.after(() => analytics.shutdown());
+  1766→      const model = {
+  1767→        provider,
+  1768→        name: 'PRIVATE_MODEL_CANARY',
+  1769→        configured: false,
+  1770→      };
+  1771→      const f = await fixture(analytics, undefined, undefined, undefined, () => model);
+  1772→      t.after(() => f.app.close());
+  1773→      assert.equal(
+  1774→        (
+  1775→          await f.app.inject({
+  1776→            method: 'POST',
+  1777→            url: '/api/account/model-setup',
+  1778→            headers: { origin },
+  1779→          })
+  1780→        ).statusCode,
+  1781→        409,
+  1782→      );
+  1783→      model.configured = true;
+  1784→      const complete = () =>
+  1785→        f.app.inject({
+  1786→          method: 'PATCH',
+  1787→          url: '/api/account',
+  1788→          headers: { origin },
+  1789→          payload: { usageData: true, onboardingCompleted: true },
+  1790→        });
+  1791→      assert.equal((await complete()).statusCode, 200);
+  1792→      assert.equal((await complete()).statusCode, 200);
+  1793→      const events = captured.filter(({ event }) => event === 'onboarding_completed');
+  1794→      assert.equal(events.length, 1);
+  1795→      assert.equal(events[0].properties.provider, expected);
+  1796→      assert.equal(Object.hasOwn(events[0].properties, 'model_provider'), false);
+  1797→      assert.equal(Object.hasOwn(events[0].properties, 'model'), false);
+  1798→      const setup = captured.filter(({ event }) => event === 'model_setup_completed');
+  1799→      assert.equal(setup.length, 1);
+  1800→      assert.equal(setup[0].properties.provider, expected);
+  1801→      assert.equal(setup[0].properties.model, 'custom');
+  1802→      assert.doesNotMatch(JSON.stringify(captured), /PRIVATE_/);
+  1803→    }
+  1804→  });
+  1805→
+  1806→  test('model setup records a usable selected model before onboarding completion with consent', async (t) => {
+  1807→    const captured: Parameters<ProductAnalytics['capture']>[0][] = [];
+  1808→    const analytics = await createAnalytics({
+  1809→      provider: { capture: (event) => captured.push(event), shutdown: async () => {} },
+  1810→      environment: 'development',
+  1811→      dataRoot: '.',
+  1812→      installationId: randomUUID(),
+  1813→    });
+  1814→    t.after(() => analytics.shutdown());
+  1815→    const selected = {
+  1816→      provider: 'openai',
+  1817→      name: 'openai/gpt-6-luna-decisions',
+  1818→      configured: false,
+  1819→    };
+  1820→    const f = await fixture(analytics, undefined, undefined, undefined, () => selected);
+  1821→    t.after(() => f.app.close());
+  1822→    const completeModelSetup = () =>
+  1823→      f.app.inject({ method: 'POST', url: '/api/account/model-setup', headers: { origin } });
+  1824→    const update = (payload: object) =>
+  1825→      f.app.inject({ method: 'PATCH', url: '/api/account', headers: { origin }, payload });
+  1826→
+  1827→    assert.equal((await completeModelSetup()).statusCode, 409);
+  1828→    selected.configured = true;
+  1829→    assert.equal((await completeModelSetup()).statusCode, 200);
+  1830→    assert.equal(captured.filter(({ event }) => event === 'model_setup_completed').length, 0);
+  1831→
+  1832→    assert.equal((await update({ usageData: true })).statusCode, 200);
+  1833→    assert.equal((await completeModelSetup()).statusCode, 200);
+  1834→    let setup = captured.filter(({ event }) => event === 'model_setup_completed');
+  1835→    assert.equal(setup.length, 1);
+  1836→    assert.equal(setup[0].properties.provider, 'openai');
+  1837→    assert.equal(setup[0].properties.model, 'openai/gpt-6-luna-decisions');
+  1838→    assert.equal(
+  1839→      captured.some(({ event }) => event === 'onboarding_completed'),
+  1840→      false,
+  1841→    );
+  1842→
+  1843→    selected.provider = 'compatible';
+  1844→    selected.name = 'https://private-model.example.test/account';
+  1845→    assert.equal((await completeModelSetup()).statusCode, 200);
+  1846→    setup = captured.filter(({ event }) => event === 'model_setup_completed');
+  1847→    assert.equal(setup.length, 2);
+  1848→    assert.equal(setup[1].properties.provider, 'compatible');
+  1849→    assert.equal(setup[1].properties.model, 'custom');
+  1850→    assert.doesNotMatch(JSON.stringify(captured), /private-model/);
+  1851→
+  1852→    assert.equal((await update({ onboardingCompleted: true })).statusCode, 200);
+  1853→    assert.equal((await completeModelSetup()).statusCode, 409);
+  1854→    setup = captured.filter(({ event }) => event === 'model_setup_completed');
+  1855→    assert.equal(setup.length, 3);
+  1856→    assert.equal(setup[2].properties.provider, 'compatible');
+  1857→    assert.equal(setup[2].properties.model, 'custom');
+  1858→    assert.deepEqual(
+  1859→      captured.slice(-2).map(({ event }) => event),
+  1860→      ['model_setup_completed', 'onboarding_completed'],
+  1861→    );
+  1862→  });
+  1863→
+  1864→  test('conversation traces stay off until the owner opts in, stop at once and leave without personal data', async (t) => {
+  1865→    const delivered: ModelTrace[] = [];
+  1866→    const traces = createModelTraces(async (trace) => {
+  1867→      delivered.push(trace);
+  1868→    }, '0.3.0');
+  1869→    traces.configure({
+  1870→      secrets: ['fixture-model-key-8c41f2'],
+  1871→      profile: async () => ({ names: ['Marta Vidal'], region: 'ES' }),
+  1872→    });
+  1873→    const f = await fixture(undefined, (enabled) => traces.configure({ enabled }));
+  1874→    t.after(() => f.app.close());
+  1875→    const request = (payload?: object) =>
+  1876→      f.app.inject({
+  1877→        method: payload ? 'PATCH' : 'GET',
+  1878→        url: payload ? '/api/account' : '/api/session',
+  1879→        headers: { origin },
+  1880→        ...(payload ? { payload } : {}),
+  1881→      });
+  1882→    const turnId = '3f2a9c4e-8b1d-4f6a-9e2b-7c5d1a0f4e83';
+  1883→    const trace = (content: string, minute = 0): ModelTrace => ({
+  1884→      id: 'e2f062ac-4a2b-466b-9fe6-b85c4e49a3d9',
+  1885→      name: 'marta.vidal@example.com',
+  1886→      provider: 'fixture-model-key-8c41f2',
+  1887→      startedAt: `2026-10-19T10:${String(minute).padStart(2, '0')}:00.000Z`,
+  1888→      endedAt: `2026-10-19T10:${String(minute).padStart(2, '0')}:01.000Z`,
+  1889→      messages: [
+  1890→        { role: 'user', content },
+  1891→        {
+  1892→          role: 'assistant',
+  1893→          content: '',
+  1894→          tool_calls: [
+  1895→            {
+  1896→              id: 'call-1',
+  1897→              type: 'function',
+  1898→              function: {
+  1899→                name: 'send_email',
+  1900→                arguments:
+  1901→                  '{"first_name":"Jordi","to":"jordi@example.com","address":{"line1":"12 Main St"},"password":"fixture-tool-secret-77","fields":[["password","fixture-pair-secret-88"]]}',
+  1902→              },
+  1903→            },
+  1904→          ],
+  1905→        },
+  1906→      ],
+  1907→      tools: ['send_email', 'Marta Vidal', `tool-${turnId}`],
+  1908→      output: { role: 'assistant', content: 'Thanks Marta, sent to +44 20 7946 0958.' },
+  1909→      usage: {
+  1910→        inputTokens: 10,
+  1911→        outputTokens: 2,
+  1912→        totalTokens: 12,
+  1913→        cacheReadTokens: 0,
+  1914→        cacheWriteTokens: 0,
+  1915→        costUsd: null,
+  1916→      },
+  1917→      metadata: { session_id: 'fixture-session', turn_id: turnId },
+  1918→    });
+  1919→    const settle = async (count: number) => {
+  1920→      for (let attempt = 0; attempt < 40 && delivered.length < count; attempt++)
+  1921→        await new Promise((resolve) => setTimeout(resolve, 5));
+  1922→    };
+  1923→    const initial = (await request()).json();
+  1924→    assert.deepEqual([initial.capabilities.traces, initial.settings.traces], [true, false]);
+  1925→    traces.record(trace('Before opting in'));
+  1926→    await settle(1);
+  1927→    assert.equal(traces.active(), false);
+  1928→    assert.equal(delivered.length, 0);
+  1929→    assert.equal((await request({ traces: true })).json().settings.traces, true);
+  1930→    assert.equal(f.record().traces, true);
+  1931→    traces.record(
+  1932→      trace(
+  1933→        `I am Marta Vidal <marta.vidal@example.com>, cc alice smith <alice@example.com>, card 4111 1111 1111 1111, IBAN ES91 2100 0418 4502 0005 1332, call 612 345 678, DNI 12345678Z, server 2001:db8::1 and 203.0.113.42. Host 192.168.1.1.example stays. Key fixture-model-key-8c41f2, order 123456 on 2026-10-19, task ${turnId.toUpperCase()}, file ${homedir()}/Library/nod.json`,
+  1934→      ),
+  1935→    );
+  1936→    await settle(1);
+  1937→    assert.equal(delivered.length, 1);
+  1938→    const sent = JSON.stringify(delivered[0]);
+  1939→    const privateContent = [delivered[0].metadata.thread_id, delivered[0].metadata.turn_id].reduce(
+  1940→      (text, id) => text.replaceAll(id, '[id]'),
+  1941→      sent,
+  1942→    );
+  1943→    for (const value of [
+  1944→      'Marta',
+  1945→      'Vidal',
+  1946→      'marta.vidal@example.com',
+  1947→      'Jordi',
+  1948→      'jordi@example.com',
+  1949→      'alice smith',
+  1950→      '12 Main St',
+  1951→      '2001:db8::1',
+  1952→      '203.0.113.42',
+  1953→      '4111',
+  1954→      'ES91',
+  1955→      '612 345 678',
+  1956→      '7946',
+  1957→      '12345678Z',
+  1958→      'fixture-model-key-8c41f2',
+  1959→      'fixture-tool-secret-77',
+  1960→      'fixture-pair-secret-88',
+  1961→    ])
+  1962→      assert.ok(!privateContent.includes(value), value);
+  1963→    assert.match(sent, /order 123456 on 2026-10-19/);
+  1964→    assert.match(sent, /192\.168\.1\.1\.example/);
+  1965→    assert.deepEqual(Object.keys(delivered[0].metadata), ['turn_id', 'thread_id', 'app_version']);
+  1966→    assert.equal(delivered[0].metadata.app_version, '0.3.0');
+  1967→    assert.match(delivered[0].metadata.thread_id, /^[0-9a-f]{32}$/);
+  1968→    assert.match(delivered[0].metadata.turn_id, /^[0-9a-f]{32}$/);
+  1969→    assert.ok(!sent.includes('fixture-session') && !sent.toLowerCase().includes(turnId));
+  1970→    assert.ok(sent.includes(`task ${delivered[0].metadata.turn_id}`));
+  1971→    assert.ok(!sent.includes(homedir()) && sent.includes('~/Library/nod.json'));
+  1972→    traces.record(trace('A second request in the same conversation', 25));
+  1973→    await settle(2);
+  1974→    traces.record(trace('A request after a long pause', 57));
+  1975→    await settle(3);
+  1976→    assert.equal(delivered[1].metadata.thread_id, delivered[0].metadata.thread_id);
+  1977→    assert.notEqual(delivered[2].metadata.thread_id, delivered[1].metadata.thread_id);
+  1978→    await request({ traces: false });
+  1979→    traces.record(trace('After opting out'));
+  1980→    await settle(4);
+  1981→    assert.equal(delivered.length, 3);
+  1982→  });
+  1983→
+  1984→  test('account changes require the same origin and owner and never accept provider or owner input', async (t) => {
+  1985→    const f = await fixture();
+  1986→    t.after(() => f.app.close());
+  1987→    const headers = { origin };
+  1988→    for (const input of [
+  1989→      { headers: { origin: 'https://foreign.example.test' }, payload: {}, status: 403 },
+  1990→      { headers: { ...headers, 'sec-fetch-site': 'cross-site' }, payload: {}, status: 403 },
+  1991→      { headers: { ...headers, 'x-nod-account': 'sam' }, payload: {}, status: 401 },
+  1992→      { headers, payload: { ownerId: 'sam' }, status: 400 },
+  1993→      { headers, payload: { provider: 'e2b' }, status: 400 },
+  1994→      { headers, payload: { templateId: 'override' }, status: 400 },
+  1995→    ]) {
+  1996→      const response = await f.app.inject({
+  1997→        method: 'POST',
+  1998→        url: '/api/account/prepare',
+  1999→        headers: input.headers,
+  2000→        payload: input.payload,
+
+[showing lines 1-2000 of 6945; use offset=2001 with limit to continue reading]

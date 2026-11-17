@@ -1,0 +1,857 @@
+     1→import {
+     2→  hasOwnerInstructions,
+     3→  validateOwnerInstructions,
+     4→  type OwnerInstructions,
+     5→} from './owner-instructions.ts';
+     6→import { execFile } from 'node:child_process';
+     7→import { randomUUID } from 'node:crypto';
+     8→import { constants, type Stats } from 'node:fs';
+     9→import {
+    10→  chmod,
+    11→  copyFile,
+    12→  cp,
+    13→  link,
+    14→  lstat,
+    15→  mkdir,
+    16→  mkdtemp,
+    17→  open,
+    18→  readdir,
+    19→  readlink,
+    20→  realpath,
+    21→  rename,
+    22→  rm,
+    23→  rmdir,
+    24→  symlink,
+    25→  writeFile,
+    26→} from 'node:fs/promises';
+    27→import { homedir } from 'node:os';
+    28→import nodePath from 'node:path';
+    29→import { promisify } from 'node:util';
+    30→import type { FastifyInstance } from 'fastify';
+    31→import type { Pool } from 'pg';
+    32→import { z } from 'zod';
+    33→import type { IntegrationFile } from '../ports/integrations.ts';
+    34→import type { Trash } from '../ports/trash.ts';
+    35→import { fileBytes, fileMimeType } from '../shared/files.ts';
+    36→import { workspaceFileReference } from './integration-files.ts';
+    37→import { IntegrationError } from './integration-connection.ts';
+    38→
+    39→const readBytes = 256 * 1024;
+    40→const writeBytes = 1024 * 1024;
+    41→const listLimit = 500;
+    42→const batchLimit = 200;
+    43→const statBatch = 100;
+    44→const noFollow = constants.O_NOFOLLOW ?? 0;
+    45→const noBlock = constants.O_NONBLOCK ?? 0;
+    46→const homePrefix = process.platform === 'win32' ? /^~(?=$|[/\\])/ : /^~(?=$|\/)/;
+    47→function absolutePath(home: string) {
+    48→  return z.preprocess(
+    49→    (value) => (typeof value === 'string' ? value.replace(homePrefix, () => home) : value),
+    50→    z
+    51→      .string()
+    52→      .min(1)
+    53→      .max(4096)
+    54→      .refine(
+    55→        (value) =>
+    56→          nodePath.isAbsolute(value) &&
+    57→          (process.platform !== 'win32' || !value.slice(2).includes(':')),
+    58→        'Use an absolute path.',
+    59→      ),
+    60→  );
+    61→}
+    62→function localFileSchemas(absolute: ReturnType<typeof absolutePath>) {
+    63→  const onePath = z.object({ path: absolute }).strict();
+    64→  return {
+    65→    LOCAL_FILES_LIST: onePath,
+    66→    LOCAL_FILES_READ: onePath,
+    67→    LOCAL_FILES_IMPORT: onePath,
+    68→    LOCAL_FILES_CREATE_FOLDER: onePath,
+    69→    LOCAL_FILES_MOVE: z
+    70→      .object({
+    71→        moves: z
+    72→          .array(z.object({ from: absolute, to: absolute }).strict())
+    73→          .min(1)
+    74→          .max(batchLimit),
+    75→      })
+    76→      .strict(),
+    77→    LOCAL_FILES_TRASH: z.object({ paths: z.array(absolute).min(1).max(batchLimit) }).strict(),
+    78→    LOCAL_FILES_WRITE: z
+    79→      .object({
+    80→        path: absolute,
+    81→        text: z.string().max(writeBytes),
+    82→        overwrite: z.boolean().optional(),
+    83→      })
+    84→      .strict(),
+    85→    LOCAL_FILES_EDIT: z
+    86→      .object({
+    87→        path: absolute,
+    88→        edits: z
+    89→          .array(z.object({ oldText: z.string().min(1), newText: z.string() }).strict())
+    90→          .min(1)
+    91→          .max(50),
+    92→      })
+    93→      .strict(),
+    94→    LOCAL_FILES_EXPORT: z
+    95→      .object({ file: workspaceFileReference, path: absolute, overwrite: z.boolean().optional() })
+    96→      .strict(),
+    97→  };
+    98→}
+    99→type Action = keyof ReturnType<typeof localFileSchemas>;
+   100→const actions = new Set(Object.keys(localFileSchemas(absolutePath(homedir()))));
+   101→const reads = new Set<Action>(['LOCAL_FILES_LIST', 'LOCAL_FILES_READ', 'LOCAL_FILES_IMPORT']);
+   102→const windowsHidden = new Set([
+   103→  'desktop.ini',
+   104→  'thumbs.db',
+   105→  '$recycle.bin',
+   106→  'system volume information',
+   107→]);
+   108→const privateFolders = new Set(['library', 'appdata', 'backups.backupdb']);
+   109→const secretNames = [
+   110→  /\.(pem|p12|pfx|ppk|kdbx|kdb|keychain|keychain-db|ovpn|gpg|asc|tfstate|1pux|1pif|env)$/i,
+   111→  /^id_(rsa|dsa|ecdsa|ed25519)/i,
+   112→  /^wallet\.dat$/i,
+   113→  /^ntuser\.dat/i,
+   114→  /credentials.*\.csv$/i,
+   115→  /^service-account.*\.json$/i,
+   116→  /^bitwarden_export/i,
+   117→];
+   118→const programs: Partial<Record<NodeJS.Platform, RegExp>> = {
+   119→  win32:
+   120→    /\.(exe|com|bat|cmd|ps1|psm1|vbs|vbe|js|jse|wsf|wsh|msi|msp|msc|msix|msixbundle|appx|appxbundle|appinstaller|application|lnk|pif|scr|cpl|hta|reg|dll|xll|inf|sct|url|appref-ms|jar|chm|scf|iso|img|vhd|vhdx|library-ms|searchconnector-ms|settingcontent-ms)$/i,
+   121→  darwin:
+   122→    /\.(command|tool|terminal|app|pkg|mpkg|dmg|mobileconfig|workflow|scpt|scptd|applescript|sh|bash|zsh|jar|webloc|inetloc|fileloc)$/i,
+   123→  linux: /\.(sh|bash|desktop|run|appimage|jar|flatpak|flatpakref|flatpakrepo)$/i,
+   124→};
+   125→const run = promisify(execFile);
+   126→const maybeLstat = (path: string) => lstat(path).catch(() => undefined);
+   127→const keepOutLimit = 100;
+   128→
+   129→type Turn = { turnId: string; threadId: string };
+   130→type Query = Pick<Pool, 'query'>;
+   131→export type WorkspaceRead = (input: z.infer<typeof workspaceFileReference>) => Promise<Uint8Array>;
+   132→
+   133→function denied(error: unknown) {
+   134→  const code = (error as NodeJS.ErrnoException).code;
+   135→  return code === 'EPERM' || code === 'EACCES';
+   136→}
+   137→
+   138→function permissionMessage(path: string) {
+   139→  return process.platform === 'darwin'
+   140→    ? `Nod can't open ${path}. Allow Nod in System Settings, Privacy & Security, Files and Folders (or Full Disk Access), then try again.`
+   141→    : `Nod can't open ${path}.`;
+   142→}
+   143→
+   144→export function isLocalFilesAction(action: string): action is Action {
+   145→  return actions.has(action);
+   146→}
+   147→
+   148→export function localFileRules(
+   149→  platform: NodeJS.Platform,
+   150→  home: string,
+   151→  dataRoot: string,
+   152→  systemDrive = 'C:',
+   153→) {
+   154→  const path = platform === 'win32' ? nodePath.win32 : nodePath.posix;
+   155→  const key = (value: string) => (platform === 'win32' ? value.toLowerCase() : value);
+   156→  const fold = (value: string) => (platform === 'linux' ? value : value.toLowerCase());
+   157→  function inside(root: string, target: string) {
+   158→    const rel = path.relative(fold(root), fold(target));
+   159→    return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+   160→  }
+   161→  function privateName(name: string) {
+   162→    const lower = name.toLowerCase();
+   163→    return (
+   164→      name.startsWith('.') ||
+   165→      (platform === 'win32' && windowsHidden.has(lower)) ||
+   166→      privateFolders.has(lower) ||
+   167→      secretNames.some((pattern) => pattern.test(name))
+   168→    );
+   169→  }
+   170→  function anchor(target: string) {
+   171→    if (inside(home, target)) return home;
+   172→    if (platform === 'darwin' && fold(target) !== '/volumes' && inside('/Volumes', target))
+   173→      return path.join('/Volumes', target.split(path.sep)[2]!);
+   174→    if (
+   175→      platform === 'win32' &&
+   176→      /^[a-z]:\\/i.test(target) &&
+   177→      key(target.slice(0, 2)) !== key(systemDrive)
+   178→    )
+   179→      return target.slice(0, 3);
+   180→    if (platform === 'linux')
+   181→      for (const mounts of ['/media', '/run/media']) {
+   182→        const [user, drive] = path.relative(mounts, target).split(path.sep);
+   183→        if (inside(mounts, target) && user && drive) return path.join(mounts, user, drive);
+   184→      }
+   185→  }
+   186→  return {
+   187→    inside,
+   188→    same: (left: string, right: string) => key(left) === key(right),
+   189→    privateName,
+   190→    anchor,
+   191→    holdsData: (target: string) => inside(target, dataRoot),
+   192→    root: (target: string) => {
+   193→      const base = anchor(target);
+   194→      return base !== undefined && inside(target, base);
+   195→    },
+   196→    privatePath(target: string) {
+   197→      const base = anchor(target);
+   198→      return (
+   199→        !base ||
+   200→        inside(dataRoot, target) ||
+   201→        path.relative(fold(base), fold(target)).split(path.sep).filter(Boolean).some(privateName)
+   202→      );
+   203→    },
+   204→    program: (name: string) => programs[platform]?.test(name) ?? false,
+   205→    executable: (name: string, mode: number) =>
+   206→      (programs[platform]?.test(name) ?? false) || (platform !== 'win32' && (mode & 0o111) !== 0),
+   207→  };
+   208→}
+   209→
+   210→export function createLocalFiles(
+   211→  pool: Pool,
+   212→  ownerId: string,
+   213→  options: { dataRoot: string; home?: string; trash?: Trash; available?: boolean },
+   214→) {
+   215→  const available = options.available ?? true;
+   216→  const home = options.home ?? homedir();
+   217→  const absolute = absolutePath(home);
+   218→  const schemas = localFileSchemas(absolute);
+   219→  const rules = Promise.all([
+   220→    realpath(home).catch(() => home),
+   221→    realpath(options.dataRoot).catch(() => options.dataRoot),
+   222→  ]).then(([realHome, realData]) =>
+   223→    localFileRules(process.platform, realHome, realData, process.env.SystemDrive),
+   224→  );
+   225→
+   226→  async function keptOut(database: Query = pool): Promise<string[]> {
+   227→    const { rows } = await database.query<{ local_keep_out: string[] }>(
+   228→      'SELECT local_keep_out FROM preferences WHERE owner_id=$1',
+   229→      [ownerId],
+   230→    );
+   231→    return rows[0]?.local_keep_out ?? [];
+   232→  }
+   233→
+   234→  async function enabled() {
+   235→    if (!available) return false;
+   236→    const { rows } = await pool.query<{ local_files_enabled: boolean }>(
+   237→      'SELECT local_files_enabled FROM preferences WHERE owner_id=$1',
+   238→      [ownerId],
+   239→    );
+   240→    return rows[0]?.local_files_enabled === true;
+   241→  }
+   242→
+   243→  async function assertEnabled() {
+   244→    if (!available) throw unavailable();
+   245→    if (!(await enabled()))
+   246→      throw new IntegrationError(
+   247→        'Local file access is off. Request localFilesEnabled: true with notification_preferences_update to ask the owner to turn it on in chat.',
+   248→        403,
+   249→      );
+   250→  }
+   251→
+   252→  async function assertStartedByOwner(turn: Turn | undefined, database: Query = pool) {
+   253→    const { rows } = turn
+   254→      ? await database.query<{
+   255→          id: string;
+   256→          source: string;
+   257→          message_id: string | null;
+   258→          proactive: boolean;
+   259→        }>(
+   260→          `WITH RECURSIVE lineage AS (
+   261→            SELECT id,parent_turn_id,source,message_id,proactive,0 AS depth FROM turns WHERE id=$1 AND owner_id=$2 AND thread_id=$3
+   262→            UNION ALL SELECT p.id,p.parent_turn_id,p.source,p.message_id,p.proactive,c.depth+1 FROM turns p JOIN lineage c ON c.parent_turn_id=p.id WHERE p.owner_id=$2 AND p.thread_id=$3 AND c.depth<100
+   263→          ) SELECT id,source,message_id,bool_or(proactive) OVER () AS proactive FROM lineage ORDER BY depth DESC LIMIT 1`,
+   264→          [turn.turnId, ownerId, turn.threadId],
+   265→        )
+   266→      : { rows: [] };
+   267→    const root = rows[0];
+   268→    const schedule =
+   269→      root?.source === 'schedule'
+   270→        ? (
+   271→            await database.query<{ authority: OwnerInstructions | null }>(
+   272→              'SELECT authority FROM schedule_runs WHERE turn_id=$1 AND owner_id=$2',
+   273→              [root.id, ownerId],
+   274→            )
+   275→          ).rows[0]
+   276→        : undefined;
+   277→    const owned =
+   278→      root &&
+   279→      !root.proactive &&
+   280→      ((root.source === 'user' && root.message_id) || hasOwnerInstructions(schedule?.authority));
+   281→    if (owned && schedule?.authority)
+   282→      await validateOwnerInstructions(database, ownerId, schedule.authority);
+   283→    if (!owned)
+   284→      throw new IntegrationError(
+   285→        "Local files only open in work the owner started: a message, or a schedule the owner set up. Nod didn't touch any file.",
+   286→        403,
+   287→      );
+   288→  }
+   289→
+   290→  async function resolvedAsFarAsItExists(path: string) {
+   291→    const missing: string[] = [];
+   292→    for (let current = path; ; current = nodePath.dirname(current)) {
+   293→      const real = await realpath(current).catch(() => undefined);
+   294→      if (real) return nodePath.join(real, ...missing.reverse());
+   295→      if (nodePath.dirname(current) === current) return path;
+   296→      missing.push(nodePath.basename(current));
+   297→    }
+   298→  }
+   299→
+   300→  async function keepOut(turn: Turn, path: string, database: Query) {
+   301→    if (!available) throw unavailable();
+   302→    await assertStartedByOwner(turn, database);
+   303→    const input = absolute.safeParse(typeof path === 'string' ? path.trim() : path);
+   304→    if (!input.success) throw new IntegrationError('Name the absolute path to keep Nod out of.');
+   305→    const real = await resolvedAsFarAsItExists(nodePath.resolve(input.data));
+   306→    const current = await keptOut(database);
+   307→    if (current.includes(real)) return current;
+   308→    if (current.length >= keepOutLimit)
+   309→      throw new IntegrationError(
+   310→        `The keep-out list already has ${keepOutLimit} folders. The owner can remove some in Settings.`,
+   311→        409,
+   312→      );
+   313→    const { rows } = await database.query<{ local_keep_out: string[] }>(
+   314→      `INSERT INTO preferences(owner_id,local_keep_out) VALUES($1,ARRAY[$2]::text[])
+   315→       ON CONFLICT(owner_id) DO UPDATE SET local_keep_out=CASE WHEN $2=ANY(preferences.local_keep_out)
+   316→         THEN preferences.local_keep_out ELSE array_append(preferences.local_keep_out,$2) END
+   317→       RETURNING local_keep_out`,
+   318→      [ownerId, real],
+   319→    );
+   320→    return rows[0]!.local_keep_out;
+   321→  }
+   322→
+   323→  async function letIn(path: string) {
+   324→    const { rows } = await pool.query<{ local_keep_out: string[] }>(
+   325→      `UPDATE preferences SET local_keep_out=array_remove(local_keep_out,$2)
+   326→       WHERE owner_id=$1 RETURNING local_keep_out`,
+   327→      [ownerId, path],
+   328→    );
+   329→    return rows[0]?.local_keep_out ?? [];
+   330→  }
+   331→
+   332→  function unavailable() {
+   333→    return new IntegrationError('Local files work only in the Nod desktop app.', 503);
+   334→  }
+   335→
+   336→  function outside(path: string) {
+   337→    return new IntegrationError(
+   338→      `${path} is outside your home folder and drives, private (hidden, a secret or Nod's own data), or the root of a drive.`,
+   339→      403,
+   340→    );
+   341→  }
+   342→
+   343→  function kept(path: string) {
+   344→    return new IntegrationError(
+   345→      `The owner told Nod to keep out of ${path}. Nothing was changed.`,
+   346→      403,
+   347→    );
+   348→  }
+   349→
+   350→  async function contained(
+   351→    real: string,
+   352→    keep: string[],
+   353→    allowRoot: boolean,
+   354→    shown: string,
+   355→    write: boolean,
+   356→  ) {
+   357→    const rule = await rules;
+   358→    if (
+   359→      rule.privatePath(real) ||
+   360→      (!allowRoot && rule.root(real)) ||
+   361→      (write && rule.holdsData(real))
+   362→    )
+   363→      throw outside(shown);
+   364→    if (keep.some((entry) => rule.inside(entry, real) || (write && rule.inside(real, entry))))
+   365→      throw kept(shown);
+   366→    return real;
+   367→  }
+   368→
+   369→  async function existing(
+   370→    path: string,
+   371→    keep: string[],
+   372→    allowRoot: boolean,
+   373→    write: boolean,
+   374→    shown = path,
+   375→  ) {
+   376→    const lexical = nodePath.resolve(path);
+   377→    const rule = await rules;
+   378→    if (rule.privatePath(lexical)) throw outside(shown);
+   379→    if (keep.some((entry) => rule.inside(entry, lexical))) throw kept(shown);
+   380→    try {
+   381→      return await contained(await realpath(path), keep, allowRoot, shown, write);
+   382→    } catch (error) {
+   383→      if (error instanceof IntegrationError) throw error;
+   384→      if (denied(error)) throw new IntegrationError(permissionMessage(path), 403);
+   385→      throw new IntegrationError(`${path} does not exist.`, 404);
+   386→    }
+   387→  }
+   388→
+   389→  async function entry(path: string, keep: string[]) {
+   390→    const parent = await existing(
+   391→      nodePath.dirname(nodePath.resolve(path)),
+   392→      keep,
+   393→      true,
+   394→      false,
+   395→      path,
+   396→    );
+   397→    const name = nodePath.basename(nodePath.resolve(path));
+   398→    if (
+   399→      process.platform === 'win32' &&
+   400→      (await maybeLstat(nodePath.join(parent, name))) &&
+   401→      !(await readdir(parent)).some((listed) => listed.toLowerCase() === name.toLowerCase())
+   402→    )
+   403→      throw outside(path);
+   404→    return contained(nodePath.join(parent, name), keep, false, path, true);
+   405→  }
+   406→
+   407→  function resolver(action: Action, keep: string[]) {
+   408→    if (action === 'LOCAL_FILES_LIST') return (path: string) => existing(path, keep, true, false);
+   409→    if (reads.has(action)) return (path: string) => existing(path, keep, false, false);
+   410→    return (path: string) => entry(path, keep);
+   411→  }
+   412→
+   413→  async function present(path: string, keep: string[]) {
+   414→    const source = await entry(path, keep);
+   415→    if (!(await maybeLstat(source))) throw new IntegrationError(`${path} does not exist.`, 404);
+   416→    return source;
+   417→  }
+   418→
+   419→  async function unchanged(target: string, keep: string[]) {
+   420→    if (!(await rules).same(await entry(target, keep), target))
+   421→      throw new IntegrationError(`The folder of ${target} changed. Nothing was changed.`, 409);
+   422→  }
+   423→
+   424→  async function trashReady() {
+   425→    if (!(await options.trash?.ready()))
+   426→      throw new IntegrationError(
+   427→        "This computer has no Trash Nod can use, so it didn't trash, replace or edit anything.",
+   428→        503,
+   429→      );
+   430→  }
+   431→
+   432→  async function toTrash(source: string, signal?: AbortSignal) {
+   433→    await trashReady();
+   434→    await options.trash!.put(source, signal);
+   435→  }
+   436→
+   437→  function taken(target: string) {
+   438→    return new IntegrationError(`${target} already exists.`, 409);
+   439→  }
+   440→
+   441→  async function place(source: string, target: string, keep: string[]) {
+   442→    await unchanged(target, keep);
+   443→    const info = await lstat(source);
+   444→    const current = await maybeLstat(target);
+   445→    if (
+   446→      current &&
+   447→      info.ino &&
+   448→      current.ino === info.ino &&
+   449→      current.dev === info.dev &&
+   450→      process.platform !== 'linux' &&
+   451→      source !== target &&
+   452→      source.toLowerCase() === target.toLowerCase()
+   453→    )
+   454→      return rename(source, target);
+   455→    if (current) throw taken(target);
+   456→    const fail = (error: NodeJS.ErrnoException) => {
+   457→      throw error.code === 'EEXIST' ? taken(target) : error;
+   458→    };
+   459→    if (info.isFile()) {
+   460→      const linked = await link(source, target).then(
+   461→        () => true,
+   462→        (error: NodeJS.ErrnoException) => (error.code === 'EEXIST' ? fail(error) : false),
+   463→      );
+   464→      if (!linked) await copyFile(source, target, constants.COPYFILE_EXCL).catch(fail);
+   465→      return rm(source).catch(async (error) => {
+   466→        await rm(target, { force: true });
+   467→        throw error;
+   468→      });
+   469→    }
+   470→    if (info.isDirectory() && process.platform !== 'win32') {
+   471→      await mkdir(target).catch(fail);
+   472→      return rename(source, target).catch(async (error: NodeJS.ErrnoException) => {
+   473→        if (error.code !== 'EXDEV') {
+   474→          await rmdir(target).catch(() => undefined);
+   475→          throw error;
+   476→        }
+   477→        try {
+   478→          for (const name of await readdir(source))
+   479→            await cp(nodePath.join(source, name), nodePath.join(target, name), {
+   480→              recursive: true,
+   481→              errorOnExist: true,
+   482→              force: false,
+   483→              verbatimSymlinks: true,
+   484→              preserveTimestamps: true,
+   485→            });
+   486→        } catch (copy) {
+   487→          await rm(target, { recursive: true, force: true });
+   488→          throw copy;
+   489→        }
+   490→        await rm(source, { recursive: true });
+   491→      });
+   492→    }
+   493→    if (info.isSymbolicLink()) {
+   494→      const pointer = await readlink(source);
+   495→      if (!nodePath.isAbsolute(pointer) && nodePath.dirname(source) !== nodePath.dirname(target))
+   496→        throw new IntegrationError(
+   497→          `${source} is a relative link, so moving it to another folder would change where it points.`,
+   498→        );
+   499→      await symlink(pointer, target).catch(fail);
+   500→      return rm(source).catch(async (error) => {
+   501→        await rm(target, { force: true });
+   502→        throw error;
+   503→      });
+   504→    }
+   505→    if (process.platform !== 'win32')
+   506→      throw new IntegrationError(`${source} is not a file, folder or link.`);
+   507→    await rename(source, target);
+   508→  }
+   509→
+   510→  async function regularFile(path: string) {
+   511→    const info = await maybeLstat(path);
+   512→    if (info && !info.isFile()) throw new IntegrationError(`${path} is not a regular file.`);
+   513→    if (info && (await rules).executable(path, info.mode))
+   514→      throw new IntegrationError(`${path} is executable. Nod only changes plain files.`);
+   515→    return info;
+   516→  }
+   517→
+   518→  async function replace(
+   519→    path: string,
+   520→    data: string | Uint8Array,
+   521→    previous: Stats | undefined,
+   522→    keep: string[],
+   523→    signal?: AbortSignal,
+   524→  ) {
+   525→    if (typeof data === 'string' && Buffer.byteLength(data) > writeBytes)
+   526→      throw new IntegrationError('The file text must be at most 1 MB. Nothing was changed.');
+   527→    if (previous) await trashReady();
+   528→    const folder = nodePath.dirname(path);
+   529→    const temporary = nodePath.join(folder, `.nod-${randomUUID()}.tmp`);
+   530→    await writeFile(temporary, data, { flag: 'wx' });
+   531→    if (!previous)
+   532→      return place(temporary, path, keep).catch(async (error) => {
+   533→        await rm(temporary, { force: true });
+   534→        throw error;
+   535→      });
+   536→    let backupFolder = '';
+   537→    let backup = '';
+   538→    try {
+   539→      backupFolder = await mkdtemp(nodePath.join(folder, '.nod-'));
+   540→      backup = nodePath.join(backupFolder, nodePath.basename(path));
+   541→      await chmod(temporary, previous.mode & 0o7777);
+   542→      await link(path, backup).catch(() => copyFile(path, backup));
+   543→      await unchanged(path, keep);
+   544→      await toTrash(path, signal);
+   545→    } catch (error) {
+   546→      await rm(temporary, { force: true });
+   547→      const lost =
+   548→        Boolean(backup) && !(await maybeLstat(path)) && Boolean(await maybeLstat(backup));
+   549→      const restored =
+   550→        lost &&
+   551→        (await place(backup, path, keep).then(
+   552→          () => true,
+   553→          () => false,
+   554→        ));
+   555→      if (backupFolder) await rm(backupFolder, { recursive: true, force: true });
+   556→      if (lost)
+   557→        throw new IntegrationError(
+   558→          restored
+   559→            ? `${path} is unchanged. The Trash answered too late, so a copy of it may also be in the Trash.`
+   560→            : `${path} went to the Trash, but its new version wasn't saved. It can be restored from the Trash.`,
+   561→          409,
+   562→        );
+   563→      throw error;
+   564→    }
+   565→    try {
+   566→      await place(temporary, path, keep);
+   567→    } catch {
+   568→      await rm(temporary, { force: true });
+   569→      const restored = await place(backup, path, keep).then(
+   570→        () => true,
+   571→        () => false,
+   572→      );
+   573→      await rm(backupFolder, { recursive: true, force: true });
+   574→      throw new IntegrationError(
+   575→        restored
+   576→          ? `${path} was not replaced and is unchanged. A copy of it is in the Trash.`
+   577→          : `${path} was not replaced. Its previous version is in the Trash.`,
+   578→        409,
+   579→      );
+   580→    }
+   581→    await rm(backupFolder, { recursive: true, force: true });
+   582→    return 'moved to the Trash';
+   583→  }
+   584→
+   585→  async function quarantine(path: string) {
+   586→    if (process.platform === 'win32')
+   587→      return writeFile(`${path}:Zone.Identifier`, '[ZoneTransfer]\r\nZoneId=3\r\n').catch(
+   588→        () => undefined,
+   589→      );
+   590→    if (process.platform !== 'darwin') return;
+   591→    const stamp = Math.floor(Date.now() / 1000).toString(16);
+   592→    await run('/usr/bin/xattr', ['-w', 'com.apple.quarantine', `0081;${stamp};Nod;`, path]).catch(
+   593→      () => undefined,
+   594→    );
+   595→  }
+   596→
+   597→  async function readFile(path: string, limit: number) {
+   598→    const checked = await maybeLstat(path);
+   599→    if (!checked?.isFile()) throw new IntegrationError(`${path} is not a file.`);
+   600→    const file = await open(path, constants.O_RDONLY | noFollow | noBlock);
+   601→    try {
+   602→      const opened = await file.stat();
+   603→      if (opened.dev !== checked.dev || opened.ino !== checked.ino)
+   604→        throw new IntegrationError(`${path} changed while Nod was opening it.`);
+   605→      const size = opened.size;
+   606→      const length = Math.min(size, limit);
+   607→      const { buffer, bytesRead } = await file.read(Buffer.alloc(length), 0, length, 0);
+   608→      return { size, bytes: buffer.subarray(0, bytesRead) };
+   609→    } finally {
+   610→      await file.close();
+   611→    }
+   612→  }
+   613→
+   614→  async function each<T>(items: T[], task: (item: T) => Promise<unknown>, signal?: AbortSignal) {
+   615→    const done: unknown[] = [];
+   616→    const failed: Array<{ item: T; error: string }> = [];
+   617→    for (const item of items) {
+   618→      signal?.throwIfAborted();
+   619→      try {
+   620→        done.push(await task(item));
+   621→      } catch (error) {
+   622→        failed.push({ item, error: error instanceof Error ? error.message : String(error) });
+   623→      }
+   624→    }
+   625→    return { done, failed };
+   626→  }
+   627→
+   628→  type Input = {
+   629→    path: string;
+   630→    moves: Array<{ from: string; to: string }>;
+   631→    paths: string[];
+   632→    text: string;
+   633→    overwrite?: boolean;
+   634→    edits: Array<{ oldText: string; newText: string }>;
+   635→    file: z.infer<typeof workspaceFileReference>;
+   636→  };
+   637→
+   638→  function validate(action: Action, args: Record<string, unknown>) {
+   639→    const parsed = schemas[action].safeParse(args);
+   640→    if (!parsed.success)
+   641→      throw new IntegrationError(
+   642→        `Invalid ${action} arguments: ${z.prettifyError(parsed.error)}. Nothing was changed.`,
+   643→      );
+   644→    return parsed.data as Partial<Input>;
+   645→  }
+   646→
+   647→  async function prepare(action: Action, args: Record<string, unknown>) {
+   648→    await assertEnabled();
+   649→    const input = validate(action, args);
+   650→    const real = resolver(action, await keptOut());
+   651→    if (input.moves)
+   652→      return {
+   653→        moves: await Promise.all(
+   654→          input.moves.map(async ({ from, to }) => ({ from: await real(from), to: await real(to) })),
+   655→        ),
+   656→      };
+   657→    if (input.paths) return { paths: await Promise.all(input.paths.map(real)) };
+   658→    return { ...input, path: await real(input.path!) };
+   659→  }
+   660→
+   661→  async function execute(
+   662→    action: Action,
+   663→    args: Record<string, unknown>,
+   664→    context: { signal?: AbortSignal; read?: WorkspaceRead } = {},
+   665→  ) {
+   666→    await assertEnabled();
+   667→    const { signal } = context;
+   668→    const input = validate(action, args) as Input;
+   669→    signal?.throwIfAborted();
+   670→    const keep = await keptOut();
+   671→    const rule = await rules;
+   672→    const resolve = resolver(action, keep);
+   673→    const bound = (resolved: string, requested: string) => {
+   674→      if (!rule.same(resolved, requested))
+   675→        throw new IntegrationError(
+   676→          `${requested} now leads somewhere else than when this action was checked. Nothing was changed.`,
+   677→          409,
+   678→        );
+   679→      return resolved;
+   680→    };
+   681→    const target = async (path: string) => bound(await resolve(path), path);
+   682→    const destination = async (path: string, source?: string) => {
+   683→      const resolved = await target(path);
+   684→      if (
+   685→        (rule.program(resolved) &&
+   686→          !(
+   687→            source &&
+   688→            nodePath.extname(source).toLowerCase() === nodePath.extname(resolved).toLowerCase()
+   689→          )) ||
+   690→        (process.platform === 'win32' && /[. ]$/.test(resolved))
+   691→      )
+   692→        throw new IntegrationError(
+   693→          `${path} would be a program or shortcut. Nod only creates plain files.`,
+   694→        );
+   695→      return resolved;
+   696→    };
+   697→    if (action === 'LOCAL_FILES_LIST') {
+   698→      const path = await target(input.path);
+   699→      const names = (await readdir(path, { withFileTypes: true })).filter(
+   700→        (item) =>
+   701→          !rule.privateName(item.name) &&
+   702→          !keep.some((entry) => rule.inside(entry, nodePath.join(path, item.name))),
+   703→      );
+   704→      const entries = [];
+   705→      for (let start = 0; start < names.length; start += statBatch) {
+   706→        signal?.throwIfAborted();
+   707→        entries.push(
+   708→          ...(await Promise.all(
+   709→            names.slice(start, start + statBatch).map(async (item) => {
+   710→              const info = await maybeLstat(nodePath.join(path, item.name));
+   711→              return {
+   712→                name: item.name,
+   713→                kind: (info ?? item).isDirectory()
+   714→                  ? 'folder'
+   715→                  : (info ?? item).isSymbolicLink()
+   716→                    ? 'link'
+   717→                    : 'file',
+   718→                size: info?.size,
+   719→                modified: info?.mtime.toISOString(),
+   720→              };
+   721→            }),
+   722→          )),
+   723→        );
+   724→      }
+   725→      entries.sort((a, b) => (b.modified ?? '').localeCompare(a.modified ?? ''));
+   726→      return {
+   727→        path,
+   728→        total: names.length,
+   729→        entries: entries.slice(0, listLimit),
+   730→        ...(names.length > listLimit ? { truncated: true } : {}),
+   731→      };
+   732→    }
+   733→    if (action === 'LOCAL_FILES_READ') {
+   734→      const path = await target(input.path);
+   735→      const { size, bytes } = await readFile(path, readBytes);
+   736→      const truncated = size > readBytes;
+   737→      if (bytes.includes(0)) return { path, size, binary: true };
+   738→      return {
+   739→        path,
+   740→        size,
+   741→        text: new TextDecoder().decode(bytes, { stream: truncated }),
+   742→        ...(truncated ? { truncated } : {}),
+   743→      };
+   744→    }
+   745→    if (action === 'LOCAL_FILES_IMPORT') {
+   746→      const path = await target(input.path);
+   747→      if (((await maybeLstat(path))?.size ?? 0) > fileBytes)
+   748→        throw new IntegrationError(`Files up to ${fileBytes / 1024 / 1024} MB can be copied.`);
+   749→      const { size, bytes } = await readFile(path, fileBytes);
+   750→      const name = nodePath.basename(path);
+   751→      const file: IntegrationFile = { name, mimeType: fileMimeType(name), bytes };
+   752→      return { path, size, file };
+   753→    }
+   754→    if (action === 'LOCAL_FILES_CREATE_FOLDER') {
+   755→      const path = await destination(input.path);
+   756→      await mkdir(path).catch((error: NodeJS.ErrnoException) => {
+   757→        throw error.code === 'EEXIST' ? taken(path) : error;
+   758→      });
+   759→      return { created: path };
+   760→    }
+   761→    if (action === 'LOCAL_FILES_WRITE' || action === 'LOCAL_FILES_EXPORT') {
+   762→      const path = await destination(input.path);
+   763→      const previous = await regularFile(path);
+   764→      if (previous && !input.overwrite)
+   765→        throw new IntegrationError(`${path} already exists. Set overwrite to replace it.`, 409);
+   766→      let data: string | Uint8Array = input.text;
+   767→      if (action === 'LOCAL_FILES_EXPORT') {
+   768→        if (!context.read) throw new IntegrationError('Workspace files are unavailable.', 503);
+   769→        data = await context.read(input.file);
+   770→      }
+   771→      const previousVersion = await replace(path, data, previous, keep, signal);
+   772→      await quarantine(path);
+   773→      return { written: path, ...(previousVersion ? { previousVersion } : {}) };
+   774→    }
+   775→    if (action === 'LOCAL_FILES_EDIT') {
+   776→      const path = await target(input.path);
+   777→      const info = await regularFile(path);
+   778→      if (!info) throw new IntegrationError(`${path} does not exist.`, 404);
+   779→      if (info.size > writeBytes)
+   780→        throw new IntegrationError('Only files up to 1 MB can be edited.');
+   781→      const { bytes } = await readFile(path, writeBytes);
+   782→      let text: string;
+   783→      try {
+   784→        if (bytes.includes(0)) throw new Error();
+   785→        text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+   786→      } catch {
+   787→        throw new IntegrationError(`${path} is not a UTF-8 text file. Nothing was changed.`);
+   788→      }
+   789→      for (const { oldText, newText } of input.edits) {
+   790→        const at = text.indexOf(oldText);
+   791→        if (at < 0 || text.indexOf(oldText, at + 1) >= 0)
+   792→          throw new IntegrationError(
+   793→            `Each oldText must appear exactly once in ${path}. Nothing was changed.`,
+   794→          );
+   795→        text = text.slice(0, at) + newText + text.slice(at + oldText.length);
+   796→      }
+   797→      const previousVersion = await replace(path, text, info, keep, signal);
+   798→      await quarantine(path);
+   799→      return { edited: path, previousVersion };
+   800→    }
+   801→    if (action === 'LOCAL_FILES_MOVE') {
+   802→      const { done, failed } = await each(
+   803→        input.moves,
+   804→        async ({ from, to }) => {
+   805→          const checked = bound(await present(from, keep), from);
+   806→          const moved = await destination(to, checked);
+   807→          const source = bound(await present(from, keep), from);
+   808→          await place(source, moved, keep);
+   809→          return { from: source, to: moved };
+   810→        },
+   811→        signal,
+   812→      );
+   813→      return { moved: done, failed };
+   814→    }
+   815→    const { done, failed } = await each(
+   816→      input.paths,
+   817→      async (path) => {
+   818→        const source = bound(await present(path, keep), path);
+   819→        await toTrash(source, signal);
+   820→        return source;
+   821→      },
+   822→      signal,
+   823→    );
+   824→    return { trashed: done, failed };
+   825→  }
+   826→
+   827→  function registerRoutes(app: FastifyInstance) {
+   828→    app.get('/api/local-files/keep-out', async () => ({
+   829→      available,
+   830→      paths: available ? await keptOut() : [],
+   831→    }));
+   832→    app.delete('/api/local-files/keep-out', async (request, reply) => {
+   833→      if (!available) return reply.code(503).send({ error: unavailable().message });
+   834→      const input = z
+   835→        .object({ path: z.string().max(4096) })
+   836→        .strict()
+   837→        .safeParse(request.body);
+   838→      if (!input.success)
+   839→        return reply.code(400).send({ error: 'Name the folder to let Nod into.' });
+   840→      return { available, paths: await letIn(input.data.path) };
+   841→    });
+   842→  }
+   843→
+   844→  return {
+   845→    available,
+   846→    enabled,
+   847→    keptOut,
+   848→    keepOut,
+   849→    assertStartedByOwner,
+   850→    prepare,
+   851→    execute,
+   852→    registerRoutes,
+   853→  };
+   854→}
+   855→
+   856→export type LocalFiles = ReturnType<typeof createLocalFiles>;
+   857→
