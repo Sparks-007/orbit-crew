@@ -2,6 +2,33 @@
 
 All notable changes to Orbit Crew are documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### M1 independent audit — verification and hardening
+
+### Added
+
+- Persistent automated integration suite (`tests/`, vitest — 99 tests) covering password hashing, session lifecycle (revocation, expiry, sliding refresh), registration/login/logout, RBAC matrix, rank hierarchy, ownership transfer, cross-tenant isolation (404 no-leak semantics, forged membership IDs), forged-payload resistance, origin/CSRF enforcement, rate limiting and env validation. Runs against SQLite (`bun run test:sqlite`) and PostgreSQL 16 (`bun run test:pg`).
+- `scripts/db-provider.mjs` — switches the Prisma datasource provider between SQLite (sandbox) and PostgreSQL (production target) in the single committed schema file.
+- `scripts/test-postgres.mjs` — orchestrates the PostgreSQL test run and always restores the SQLite default.
+- CI jobs: integration tests on SQLite, integration tests against a PostgreSQL 16 service container, Prisma schema validation, and a production build from a clean checkout.
+- `src/instrumentation.ts` — fail-fast startup: invalid production configuration aborts the process at boot (exit code 1) instead of surfacing as a 500 on first secret use.
+
+### Security
+
+- Ownership transfer is now race-safe under PostgreSQL READ COMMITTED: the demotion step is a conditional update that only succeeds while the actor still holds OWNER, so concurrent transfers cannot produce two owners (verified by a dedicated concurrency test).
+- Granting the ADMIN role is now OWNER-only, matching the documented RBAC matrix (previously an ADMIN could promote a MEMBER to ADMIN via the role-update endpoint).
+- `Origin: null` is now rejected on mutating requests (sandboxed-iframe contexts a legitimate client never produces).
+- The internal-host CSRF tolerance (sandbox preview gateway) is now disabled in production — mismatched external origins always fail closed there.
+- Production additionally rejects an `AUTH_SECRET` copied verbatim from `.env.example` (placeholder values previously passed the length check).
+- `next build` no longer ignores TypeScript errors (`typescript.ignoreBuildErrors` removed; `bun run typecheck` and the CI build both enforce it).
+- Image optimization is disabled (`images.unoptimized`) — M1 ships no `next/image` usage, keeping the sharp decoder stack out of the production request path.
+
+### Verified
+
+- PostgreSQL 16.15 compatibility exercised end-to-end: schema validation, fresh-database initialization from the schema, unique constraints / indexes / CASCADE foreign keys verified on the server, and the full functional suite (registration, login, organizations, memberships, switching, role changes, ownership transfer, cross-tenant restrictions, concurrent transfers) — 99/99 passing on both SQLite and PostgreSQL.
+- Production runtime verified over HTTP: fail-fast boot without secrets, health probe, register/session flows with HttpOnly + Secure cookies.
+
 ## [0.1.0] — 2026-11-17
 
 ### M1 — Project Foundation

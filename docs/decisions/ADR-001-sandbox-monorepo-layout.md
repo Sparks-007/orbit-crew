@@ -27,3 +27,24 @@ The current cloud sandbox, however, runs a single pre-provisioned Next.js applic
 ## Revisit trigger
 
 Start of Batch 2, or as soon as a second service (non-web) needs to share code with the app — whichever comes first.
+
+## 2026-11-18 audit review
+
+Re-evaluated as part of the M1 audit, with Batch 2 (M2 Model Gateway + BYOK,
+M3 AI employee creation) in scope. **Recommendation: Option A — keep the
+current structure for Batch 2.** Rationale:
+
+- M2's work (model gateway, encrypted credentials, usage tracking) is
+  entirely contained in the Next.js control plane; no second service shares
+  code yet, so the split buys no build isolation today.
+- `services/runtime/` remains a documented placeholder until M3/M4; the
+  trigger in this ADR has not fired.
+- A pre-M2 restructuring would land a large mechanical migration (import
+  remapping, workspace tooling, CI changes) immediately before the most
+  security-sensitive milestone (credential storage), maximizing review
+  surface for zero functional gain.
+- The migration path documented above stays valid and is exercised as a
+  "move, not a rewrite" when the trigger fires.
+
+Re-review at the start of Batch 3 (M4), when the runtime service begins to
+consume shared contracts.

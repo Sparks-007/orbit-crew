@@ -13,6 +13,15 @@ import { z } from "zod";
 const DEV_FALLBACK_SECRET =
   "orbit-crew-dev-insecure-secret-change-me-0000000000000000";
 
+/**
+ * Placeholder values copied verbatim from .env.example would pass a plain
+ * length check, so production additionally rejects any AUTH_SECRET that
+ * still looks like the documented placeholder. Fail-safe beats fail-open.
+ */
+function looksLikePlaceholder(secret: string): boolean {
+  return /^change-me/i.test(secret);
+}
+
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   AUTH_SECRET: z
@@ -41,6 +50,14 @@ export function getEnv(): Env {
 
   const isProduction = process.env.NODE_ENV === "production";
   if (isProduction) {
+    if (
+      process.env.AUTH_SECRET &&
+      looksLikePlaceholder(process.env.AUTH_SECRET)
+    ) {
+      throw new Error(
+        "Invalid environment configuration. AUTH_SECRET is still the .env.example placeholder — generate a unique secret (openssl rand -base64 32) before starting in production."
+      );
+    }
     const detail = parsed.error.issues
       .map((issue) => `${issue.path.map(String).join(".") || "env"}: ${issue.message}`)
       .join("; ");
@@ -64,4 +81,12 @@ export function getEnv(): Env {
 
 export function isProductionEnv(): boolean {
   return getEnv().NODE_ENV === "production";
+}
+
+/**
+ * @internal test-only — vitest mutates APP_URL between cases; the cache must
+ * be cleared for the new value to be observed. Not part of the public API.
+ */
+export function resetEnvCacheForTests(): void {
+  cached = null;
 }

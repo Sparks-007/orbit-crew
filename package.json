@@ -11,7 +11,11 @@
     "db:push": "prisma db push --accept-data-loss",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
-    "db:reset": "prisma migrate reset"
+    "db:reset": "prisma migrate reset",
+    "db:provider": "node scripts/db-provider.mjs",
+    "test": "bun run test:sqlite",
+    "test:sqlite": "rm -f db/test.db && DATABASE_URL=\"file:$PWD/db/test.db\" prisma db push --skip-generate && DATABASE_URL=\"file:$PWD/db/test.db\" vitest run",
+    "test:pg": "node scripts/test-postgres.mjs"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",
@@ -90,6 +94,7 @@
     "eslint-config-next": "^16.1.1",
     "tailwindcss": "^4",
     "tw-animate-css": "^1.3.5",
-    "typescript": "^5"
+    "typescript": "^5",
+    "vitest": "^3"
   }
 }

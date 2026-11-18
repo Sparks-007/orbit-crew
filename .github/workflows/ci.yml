@@ -1,6 +1,7 @@
 # CI — quality gates for the M1 foundation.
-# Production builds and the test suite are added in later milestones;
-# no `next build` runs in this environment yet.
+# Lint + typecheck + Prisma validation, the integration test suite on SQLite
+# (sandbox parity) and against PostgreSQL 16 (the production target), plus a
+# production build from a clean checkout.
 
 name: CI
 
@@ -14,6 +15,51 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
-      - run: bun install
+      - run: bun install --frozen-lockfile
       - run: bun run lint
       - run: bun run typecheck
+      - run: bunx prisma validate
+
+  tests-sqlite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun run test:sqlite
+
+  tests-postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: orbit
+          POSTGRES_PASSWORD: orbit
+          POSTGRES_DB: orbit_crew_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U orbit -d orbit_crew_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PG_TEST_URL: postgres://orbit:orbit@127.0.0.1:5432/orbit_crew_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun run test:pg
+
+  build:
+    runs-on: ubuntu-latest
+    env:
+      # Placeholder build-time values: the image/CI never embeds real secrets.
+      DATABASE_URL: file:/tmp/ci-build.db
+      AUTH_SECRET: ci-placeholder-secret-0123456789abcdef-0123456789abcdef
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun run build

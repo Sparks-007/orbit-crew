@@ -90,3 +90,16 @@ What is implemented:
 At that point, re-verify Better Auth (or equivalent) against Next.js 16 +
 Prisma + PostgreSQL, and migrate `User`/`Session` to the library-owned
 tables.
+
+## 2026-11-18 audit verdict — retained
+
+The independent M1 audit re-evaluated this decision and **retained custom
+authentication** for M1. Evidence: scrypt parameters (N=16384, r=8, p=1)
+match current OWASP guidance; tokens are CSPRNG-generated, HMAC-hashed at
+rest and server-side revocable; enumeration defenses are sound; and the
+whole surface is now covered by the persistent test suite (99 tests,
+including revocation, expiry, sliding refresh and tampering cases). No
+technical or security reason to force a library migration was found. Hardened
+during the audit: ownership-transfer race safety, ADMIN-grant escalation fix,
+Origin-null rejection, production fail-fast startup and placeholder-secret
+rejection. The revisit trigger above is unchanged.

@@ -24,3 +24,14 @@ The master spec mandates PostgreSQL as the production database. The current sand
 ## Revisit trigger
 
 M2 (encrypted BYOK credentials and transactional usage tracking at scale), or the first multi-instance deployment — whichever comes first.
+
+## 2026-11-18 audit verification
+
+The "schema ports cleanly" claim was put to the test: the full integration
+suite was executed against **PostgreSQL 16.15** (schema validation, fresh
+database initialization via `db push`, server-side verification of every
+unique index / FK cascade, and 99/99 functional tests including the
+concurrent ownership-transfer case under READ COMMITTED). The provider
+switch is automated by `scripts/db-provider.mjs` and exercised in CI
+(`tests-postgres` job with a `postgres:16-alpine` service). Details in
+`docs/architecture/database.md`.

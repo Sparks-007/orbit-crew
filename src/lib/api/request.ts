@@ -1,5 +1,5 @@
 import type { NextRequest } from "next/server";
-import { getEnv } from "@/lib/env";
+import { getEnv, isProductionEnv } from "@/lib/env";
 import { ApiError } from "./errors";
 
 /**
@@ -49,13 +49,22 @@ function isInternalHost(hostHeader: string): boolean {
  * - Host rewritten to an internal address by the local preview gateway
  *   (Origin is external, Host is localhost) -> allowed, because SameSite=Lax
  *   still applies and this is how the sandbox preview proxy forwards.
+ *   This tolerance is DISABLED in production: there a mismatched external
+ *   Origin is always rejected (fail-closed).
  */
 export function assertSameOrigin(req: NextRequest): void {
   const method = req.method.toUpperCase();
   if (method === "GET" || method === "HEAD" || method === "OPTIONS") return;
 
   const origin = req.headers.get("origin");
-  if (!origin || origin === "null") return;
+  if (!origin) return;
+  // Browsers send `Origin: null` for sandboxed iframes and certain redirect
+  // flows — contexts a legitimate same-site client never produces for
+  // mutations. Treat it as hostile rather than absent (SameSite=Lax remains
+  // the baseline defense; this is defense-in-depth).
+  if (origin === "null") {
+    throw ApiError.forbidden("Cross-origin request blocked.");
+  }
 
   let originHost: string;
   try {
@@ -77,7 +86,7 @@ export function assertSameOrigin(req: NextRequest): void {
   }
 
   if (allowedHosts.has(originHost)) return;
-  if (hostHeader && isInternalHost(hostHeader)) return;
+  if (hostHeader && isInternalHost(hostHeader) && !isProductionEnv()) return;
 
   throw ApiError.forbidden("Cross-origin request blocked.");
 }

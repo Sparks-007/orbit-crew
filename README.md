@@ -49,10 +49,17 @@ bun run dev               # http://localhost:3000
 | `bun run dev` | Development server on :3000 |
 | `bun run lint` | ESLint |
 | `bun run typecheck` | `tsc --noEmit` |
+| `bun run test` | Integration suite on a throwaway SQLite database |
+| `bun run test:pg` | Same suite against PostgreSQL 16 (`PG_TEST_URL=postgres://…`) |
 | `bun run db:push` | Push `prisma/schema.prisma` to the database |
 | `bun run db:generate` | Generate the Prisma client |
 | `bun run db:migrate` | Create/apply a development migration |
 | `bun run db:reset` | Reset the database |
+
+The integration suite (`tests/`) covers authentication, sessions, RBAC,
+cross-tenant isolation, origin/CSRF enforcement, rate limiting and the
+single-owner invariant — 99 tests, executed against SQLite locally and against
+PostgreSQL 16 in CI.
 
 ## Repository structure
 

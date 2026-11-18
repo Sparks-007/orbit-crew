@@ -6,7 +6,18 @@ Status: M1 — Project Foundation (v0.1.0, 2026-11-17).
 
 - Provider: **SQLite** through Prisma (`datasource db { provider = "sqlite" }` in `prisma/schema.prisma`).
 - Location: `DATABASE_URL=file:/home/z/my-project/db/custom.db` (see `.env.example`). The `db/` directory is gitignored.
-- Schema management: `bun run db:push` (declarative push with `--accept-data-loss`) — acceptable for sandbox iteration; migrations are adopted at the PostgreSQL switch.
+- Schema management: `bun run db:push` (declarative push with `--accept-data-loss`) — acceptable for sandbox iteration; migrations are adopted at the PostgreSQL switch. **No committed migrations exist yet** — a fresh database is initialized from the schema via `db push`, which is the exact path the CI PostgreSQL job exercises.
+
+## PostgreSQL verification (2026-11-18 audit)
+
+PostgreSQL compatibility is **verified by execution**, not assumed from schema portability:
+
+- Server: PostgreSQL **16.15** (matches the `postgres:16-alpine` compose service major version).
+- `prisma validate` and `prisma db push` succeed against PostgreSQL after switching the provider with `scripts/db-provider.mjs`.
+- Server-side catalog checks confirm every constraint lands: unique indexes on `User.email`, `Organization.slug`, `Session.tokenHash`, `Membership(userId, organizationId)`; plain indexes on `Session.userId`, `Membership.organizationId`; CASCADE foreign keys on `Session` and `Membership`.
+- The full integration suite (99 tests) passes against PostgreSQL: registration, login/logout/revocation, organization creation, membership creation, organization switching, role changes, ownership transfer (including the concurrent-transfer race test), and cross-tenant restrictions.
+- Reproduce locally: start any PostgreSQL 16 instance, then
+  `PG_TEST_URL=postgres://user:pass@host:5432/db bun run test:pg` (CI does this with a service container).
 
 ## Production target
 

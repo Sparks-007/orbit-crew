@@ -95,7 +95,62 @@ errors and zero page errors across the whole pass:
 6. **Client IP trust** — `getClientIp` trusts `X-Forwarded-For` from the
    gateway; production must restrict this to the known proxy hop.
 
-## 4. Sign-off
+## 4. Independent audit (2026-11-18)
+
+A second, source-level audit re-verified the controls above against the M1
+baseline (`df7b0ed`) and added persistent automation. Results:
+
+### Fixed findings
+
+| # | Finding | Severity | Fix | Verification |
+|---|---------|----------|-----|--------------|
+| F1 | Concurrent ownership transfers could produce two OWNERs under PostgreSQL READ COMMITTED (both transactions read the actor as OWNER before demoting) | High | Conditional demotion (`updateMany where role="OWNER"`) as the serialization point; loser gets CONFLICT | `tests/orgs.test.ts` concurrency test passes on PostgreSQL 16.15 and SQLite |
+| F2 | ADMIN could promote a MEMBER to ADMIN via `PATCH /members/[id]` — permission was keyed on the target's current role, contradicting the documented matrix ("granting ADMIN requires OWNER") | High | New guard: granting ADMIN requires `member:add:admin` (OWNER-only) | `tests/orgs.test.ts` "ADMIN cannot grant the ADMIN role" |
+| F3 | Production accepted an AUTH_SECRET copied verbatim from `.env.example` (placeholder passes `min(32)`) | Medium | Placeholder values rejected at startup in production | `src/lib/env.ts`; startup abort verified (exit 1) |
+| F4 | `Origin: null` was treated as "no origin" and allowed on mutations | Medium | Rejected (sandboxed-iframe contexts a legitimate client never produces) | unit + route tests |
+| F5 | Internal-host CSRF tolerance (preview gateway) applied in every environment | Medium | Disabled in production — mismatched external origins fail closed | production-mode test |
+| F6 | `next.config.ts` set `typescript.ignoreBuildErrors: true` — the production build would not fail on type errors | Medium | Removed; `next build` type-checks again | build passes without it |
+| F7 | Server booted with missing AUTH_SECRET in production (500s only at first secret use) | Low-Med | `src/instrumentation.ts` fails fast at boot (exit code 1) | boot without secret → exit 1 |
+| F8 | sharp (known CVEs in libvips/libheif/librsvg) shipped in the standalone bundle as Next's image-optimizer backend, reachable via `/_next/image` | Medium | `images.unoptimized: true` — M1 has zero `next/image` usage | no functional impact; bundle path removed from request flow |
+
+### New persistent automation (replaces "manual checks only")
+
+- `tests/` — 99 vitest tests, run against SQLite and PostgreSQL 16.15
+  (`bun run test:sqlite` / `PG_TEST_URL=… bun run test:pg`). Covers
+  registration/login/logout, revocation, expiry, sliding refresh, RBAC
+  matrix, rank hierarchy, ownership transfer (incl. concurrency),
+  cross-tenant matrix, forged IDs/payloads, origin/CSRF checks, rate limits.
+- CI: `tests-sqlite`, `tests-postgres` (postgres:16-alpine service), plus
+  `prisma validate` and a production build job.
+- PostgreSQL compatibility is now evidence-backed: schema validation, fresh
+  database initialization, unique indexes / FK cascades verified on the
+  server via catalog queries, and 99/99 functional tests passing.
+
+### Remaining known gaps (unchanged, tracked)
+
+1. In-memory rate limiting (per-process; multi-instance needs a shared store).
+2. `getClientIp` trusts `X-Forwarded-For` — spoofable per-IP limits until the
+   proxy hop is pinned in production.
+3. No email verification / password reset (ADR-002 follow-ups).
+4. No audit log (M7).
+5. No committed migrations yet — `prisma db push` workflow until the
+   PostgreSQL migration adoption (documented in database.md; fresh-init
+   verified).
+6. Security headers / CSP still to configure before public release.
+7. Session/DB hygiene: expired and revoked session rows are never purged
+   (add a cleanup job in a later milestone).
+
+### Custom authentication decision (ADR-002) — audit verdict
+
+**Retained.** The implementation is compact (~600 lines), parameterized, and
+now covered by the automated suite. No technical or security reason was found
+to force a library migration for M1: scrypt parameters match current OWASP
+guidance, tokens use a CSPRNG with HMAC-at-rest, revocation works, and the
+enumeration defenses are sound. The documented revisit trigger (start of M2 /
+first production deployment) stands; when Better Auth is re-evaluated, the
+schema mapping notes in ADR-002 apply.
+
+## 5. Sign-off
 
 M1 security requirements are implemented and verified. The next batch
 (M2) must re-run this review as a delta and extend it with credential-vault

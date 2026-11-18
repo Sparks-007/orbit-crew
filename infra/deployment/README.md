@@ -22,7 +22,7 @@ Status: M1 — Project Foundation (v0.1.0, 2026-11-17). Reference architecture: 
 1. **Database provider** — the schema targets SQLite in the sandbox. Complete the PostgreSQL switch per [docs/architecture/database.md](../../docs/architecture/database.md) before using the compose stack.
 2. **AUTH_SECRET** — inject from a secret manager (never a committed file). Minimum 32 characters: `openssl rand -base64 32`. The app fails fast in production without it.
 3. **APP_URL** — set the canonical public URL; it participates in the same-origin CSRF check behind proxies.
-4. **Migrations** — run `prisma migrate deploy` against the production database before first start (and on each release). The image ships the Prisma schema for this purpose.
+4. **Migrations** — `prisma migrate deploy` is the long-term path and the image ships the Prisma schema for it, but **no committed migrations exist yet** (ADR-003: the sandbox uses the `prisma db push` workflow). Until migrations are adopted, initialize a fresh database with `prisma db push` after completing the provider switch — this path is exercised automatically by the `tests-postgres` CI job.
 5. **Health check** — verify `GET /api/health` returns `200 {"status":"ok"}` after deploy; wire load balancer health checks to it.
 6. **TLS** — enable HTTPS at the edge; session cookies are already flagged `Secure` in production.
 7. **Secret scanning** — enable secret scanning on the repository to keep credentials out of version control.

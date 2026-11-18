@@ -206,17 +206,44 @@ export async function updateMemberRole(
       throw ApiError.forbidden("Only the owner can transfer ownership.");
     }
     return await db.$transaction(async (tx) => {
-      await tx.membership.update({
-        where: { id: ctx.actorMembershipId },
+      // Conditional demotion: only the transaction that observes the actor
+      // still holding OWNER may proceed. Two concurrent transfers from the
+      // same owner cannot both win — the loser gets CONFLICT — so the
+      // single-owner invariant holds even under PostgreSQL's default READ
+      // COMMITTED isolation (verified by tests/orgs.test.ts).
+      const demoted = await tx.membership.updateMany({
+        where: { id: ctx.actorMembershipId, role: "OWNER" },
         data: { role: "ADMIN" },
       });
+      if (demoted.count !== 1) {
+        throw ApiError.conflict(
+          "Ownership has already been transferred. Refresh and try again."
+        );
+      }
       const updated = await tx.membership.update({
         where: { id: target.id },
         data: { role: "OWNER" },
         include: { user: { select: SELECT_USER } },
       });
       return toMemberDto(updated);
+    }).catch((error) => {
+      // The target membership may have been removed concurrently between the
+      // read above and this write (e.g. by the same owner in another tab).
+      if (
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === "P2025"
+      ) {
+        throw ApiError.notFound("Member not found.");
+      }
+      throw error;
     });
+  }
+
+  // Granting the ADMIN role requires OWNER (see the matrix above): otherwise
+  // an ADMIN could promote a MEMBER to a peer rank — an escalation the
+  // documented matrix forbids. Demotions stay governed by rank checks below.
+  if (input.role === "ADMIN" && !hasPermission(ctx.actorRole, "member:add:admin")) {
+    throw ApiError.forbidden("Only the owner can grant the ADMIN role.");
   }
 
   // Cannot act on members with equal or higher rank.
