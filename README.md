@@ -133,7 +133,7 @@ Full detail and per-milestone status: [ROADMAP.md](ROADMAP.md).
 
 ## Community edition direction
 
-Orbit Crew is intended to grow an open, self-hostable community edition built on this repository's control-plane foundation, alongside options for hosted and commercially supported offerings. **The licensing and edition split is not finalized** — no LICENSE file exists yet, and terms will be published before any public release. Until then, all rights are reserved and contributions are governed by [CONTRIBUTING.md](CONTRIBUTING.md).
+Orbit Crew is intended to grow an open, self-hostable community edition built on this repository's control-plane foundation, alongside options for hosted and commercially supported offerings. **This repository's code is licensed under AGPL-3.0** — see [License](#license) and the [LICENSE](./LICENSE) file; the edition and offering split remains under consideration. Contributions are governed by [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Security
 
@@ -174,4 +174,6 @@ This sandbox workspace maps to the future `apps/web` package of the planned pnpm
 
 ## License
 
-Proprietary — all rights reserved. License terms to be finalized before public release (see [Community edition direction](#community-edition-direction)).
+Orbit Crew is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).
+
+See [LICENSE](./LICENSE) for the full license text.

@@ -60,4 +60,4 @@ Every pull request must keep the automated suite green. CI (`.github/workflows/c
 - Never commit secrets (`.env`, API keys, tokens); `.env` is gitignored and only `.env.example` with placeholders is tracked.
 - Do not open public issues for security problems. Follow the private reporting process in [SECURITY.md](SECURITY.md).
 - Preserve the security architecture: server-side identity resolution, membership-scoped queries, the 404 no-leak convention for foreign-tenant resources, same-origin enforcement on mutations, and fail-fast production environment validation. Changes that relax any of these need explicit maintainer approval and test coverage proving the risk is addressed.
-- Keep dependencies minimal; new packages must have a clear justification and license compatibility (licensing strategy is being finalized).
+- Keep dependencies minimal; new packages must have a clear justification and license compatibility (the project is licensed under AGPL-3.0).
