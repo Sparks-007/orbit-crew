@@ -16,6 +16,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
+      # Bun does not run @prisma/client's postinstall unless the package is in
+      # trustedDependencies; generate explicitly so typecheck sees real types.
+      - run: bunx prisma generate
       - run: bun run lint
       - run: bun run typecheck
       - run: bunx prisma validate
@@ -62,4 +65,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
+      # next build type-checks since the audit commit (ignoreBuildErrors is
+      # gone) — the generated client must exist before the build.
+      - run: bunx prisma generate
       - run: bun run build
