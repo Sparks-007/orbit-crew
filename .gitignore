@@ -37,6 +37,9 @@ yarn-error.log*
 # runtime database (sandbox sqlite)
 /db
 
+# delivered patch archives (transfer artifacts, never committed)
+public/*.zip
+
 # sandbox runtime tooling and state
 /.zscripts
 

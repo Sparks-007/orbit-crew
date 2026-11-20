@@ -21,7 +21,11 @@ jobs:
       - run: bunx prisma generate
       - run: bun run lint
       - run: bun run typecheck
+      # prisma validate never connects, but the schema's env("DATABASE_URL")
+      # must resolve. CI has no .env file, so provide a SQLite placeholder.
       - run: bunx prisma validate
+        env:
+          DATABASE_URL: file:./dev.db
 
   tests-sqlite:
     runs-on: ubuntu-latest

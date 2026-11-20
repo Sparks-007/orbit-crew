@@ -1,49 +1,47 @@
-# Orbit Crew — M1 CI Prisma Fix (Change Manifest)
+# Orbit Crew — M1 CI `prisma validate` Fix (Change Manifest)
 
-Base commit: `e600163` (audit commit — "audit(m1): independent verification, security hardening, persistent tests")
-Result commit in dev environment: `855a07b4f0fdecedd4703714e54ed7113d0c534e` — "fix(ci): generate Prisma Client in clean environments"
+Base commit: `855a07b4f0fdecedd4703714e54ed7113d0c534e` ("fix(ci): generate Prisma Client in clean environments")
+Result commit in dev environment: `bfa52ef9c0f86c1add9074b87073cd6446c61cdc` — "fix(ci): provide DATABASE_URL placeholder for prisma validate"
 
-## Purpose
+## Problem
 
-Fix the four GitHub Actions CI failures observed on the first run of commit `e600163`
-(`quality`, `tests-sqlite`, `build` FAILED; `tests-postgres` PASSED).
+GitHub Actions `quality` job failed at `bunx prisma validate` with
+`Error code: P1012 — Environment variable not found: DATABASE_URL`.
 
-Root cause: Bun does not execute `@prisma/client`'s `postinstall` script unless the
-package is listed in `trustedDependencies`. In a clean CI checkout no Prisma Client was
-generated, so `@prisma/client` exported neither `Prisma` nor `PrismaClient`, and
-`.prisma/client/default` did not exist. The only passing job (tests-postgres) was the
-only job whose script ran `prisma generate` explicitly. The TypeScript "`error` is
-unknown" reports in the auth/organization services were downstream of the unresolved
-`Prisma` namespace and disappear once the client is generated (verified: `tsc --noEmit`
-exit 0, no source changes required).
+Why: the schema declares `url = env("DATABASE_URL")`, and the Prisma CLI requires
+that variable to be **defined** even though `validate` never connects to a database.
+Locally the gitignored `.env` file provides it; a clean CI checkout has no `.env`.
+`prisma generate` (the preceding step) does not require it, which is why only the
+validate step failed. The `build` job already sets `DATABASE_URL` at job level, and
+both test scripts set their own URLs — only the `quality` job's validate step was
+missing it.
 
 ## Files in this archive
 
 | # | Relative path | Change type | Purpose |
 |---|---|---|---|
-| 1 | `package.json` | MODIFIED | (a) Add `"trustedDependencies": ["@prisma/client", "@prisma/engines"]` so Bun runs Prisma's postinstall generation on clean installs. (b) Make `test:sqlite` provider-safe and self-generating: it now forces the SQLite provider (`node scripts/db-provider.mjs sqlite`) before touching the schema, and runs `prisma generate` explicitly before `vitest run`. `--skip-generate` is retained on `prisma db push`; generation is a separate, explicit, correctly-ordered step. |
-| 2 | `.github/workflows/ci.yml` | MODIFIED | Add an explicit `bunx prisma generate` step to the `quality` job (before lint/typecheck) and to the `build` job (before `next build`, which type-checks since `ignoreBuildErrors` was removed in the audit commit). The four jobs remain: quality, tests-sqlite, tests-postgres, build. The PostgreSQL job keeps its postgres:16-alpine service container unchanged. |
-| 3 | `bun.lock` | MODIFIED | Lockfile regenerated after the `package.json` change; records `trustedDependencies` for `@prisma/client` and `@prisma/engines` so `bun install --frozen-lockfile` stays valid. |
+| 1 | `.github/workflows/ci.yml` | MODIFIED | Add a step-level `env: DATABASE_URL: file:./dev.db` (safe SQLite placeholder, no real credentials) to the `bunx prisma validate` step of the `quality` job, with an explanatory comment. All four jobs, their order, and the PostgreSQL service container are unchanged. |
+| 2 | `.gitignore` | MODIFIED | Add `public/*.zip` under a new "delivered patch archives" comment. Reason: the dev environment's platform auto-commit machinery committed the previous delivery ZIP (`public/Orbit-Crew_M1-CI-Prisma-Fix_e600163.zip`) into local-only history as a UUID commit; this ignore rule prevents patch artifacts from ever being committed again. The rule does not affect Next.js static serving of the ZIP for download. If you prefer not to carry this change, drop the `.gitignore` file from the archive — it is independent of the CI fix. |
 
 No files were deleted or renamed (`DELETED_FILES.md` intentionally omitted).
 
 ## What was verified before packaging
 
-- Clean-environment install: `rm -rf node_modules` + `bun install --frozen-lockfile`
-  generates the Prisma Client automatically (postinstall now trusted).
-- `bun run lint` — PASS.
-- `bun run typecheck` — PASS (unknown-type errors gone).
-- `bun run test:sqlite` — PASS, 99/99.
-- `bun run test:pg` against an isolated PostgreSQL 16.15 — PASS, 99/99; provider
-  automatically restored to SQLite afterwards.
-- Production build with placeholder env — PASS.
-- Provider switching verified for both providers; committed schema is SQLite.
+- Reproduced the exact CI failure in a clean directory (no `.env`, no
+  `DATABASE_URL`): `prisma validate` → `P1012 Environment variable not found:
+  DATABASE_URL`.
+- Applied the fix value: `DATABASE_URL=file:./dev.db prisma validate` →
+  "The schema is valid".
+- Regression: `bunx prisma validate` in the real project → valid.
+- YAML parse check: all four jobs present (quality, tests-sqlite, tests-postgres,
+  build).
+- Archive contents byte-compared against commit `bfa52ef`.
 
 ## Application notes
 
-- Extract this archive directly into the existing `orbit-crew` project root (the
-  folder containing `package.json`), replacing the three existing files.
-- Apply on top of commit `e600163` in your Windows repository, then commit locally
-  with the message: `fix(ci): generate Prisma Client in clean environments`.
-- This archive contains no secrets, no generated/build artifacts, no logs, and no
-  unchanged project files.
+- Extract directly into your existing `orbit-crew` project root (the folder
+  containing `package.json`), replacing `.github/workflows/ci.yml` and `.gitignore`.
+- Commit locally on top of your `855a07b`-equivalent commit with the message:
+  `fix(ci): provide DATABASE_URL placeholder for prisma validate`.
+- Contains no secrets, no generated/build artifacts, no logs, no database files,
+  and no unchanged project files.
