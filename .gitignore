@@ -39,9 +39,17 @@ yarn-error.log*
 
 # delivered patch archives (transfer artifacts, never committed)
 public/*.zip
+public/*.manifest.txt
 
 # sandbox runtime tooling and state
 /.zscripts
+
+# sandbox artifacts removed before public release — do not reintroduce
+/tool-results/
+/mini-services/
+/download/
+/examples/websocket/
+/Caddyfile
 
 # vercel
 .vercel
@@ -56,8 +64,6 @@ local-*
 *.log
 dev.log
 dev.out.log
-test
-prompt
 
 server.log
 # Skills directory

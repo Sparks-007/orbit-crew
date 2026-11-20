@@ -8,7 +8,7 @@ import { getEnv, resetEnvCacheForTests } from "@/lib/env";
 import { GET as orgDetailRoute, PATCH as orgRenameRoute, DELETE as orgDeleteRoute } from "@/app/api/orgs/[slug]/route";
 import { GET as orgsListRoute, POST as orgsCreateRoute } from "@/app/api/orgs/route";
 import { GET as membersListRoute, POST as membersAddRoute } from "@/app/api/orgs/[slug]/members/route";
-import { PATCH as memberPatchRoute } from "@/app/api/orgs/[slug]/members/[membershipId]/route";
+import { PATCH as memberPatchRoute, DELETE as memberDeleteRoute } from "@/app/api/orgs/[slug]/members/[membershipId]/route";
 import { GET as sessionRoute } from "@/app/api/auth/session/route";
 import { SESSION_COOKIE } from "@/lib/auth/session";
 import {
@@ -278,6 +278,54 @@ describe("org routes (HTTP authorization)", () => {
       ctx({ slug, membershipId: foreignMembershipId })
     );
     expect(res.status).toBe(404);
+  });
+
+  it("owner removes a member via DELETE membership route (200, row deleted)", async () => {
+    const membershipId = (
+      await db.membership.findFirstOrThrow({ where: { userId: member.id, organizationId: orgId } })
+    ).id;
+    const res = await memberDeleteRoute(
+      authed(`/api/orgs/${slug}/members/${membershipId}`, ownerSession, {
+        method: "DELETE",
+      }),
+      ctx({ slug, membershipId })
+    );
+    expect(res.status).toBe(200);
+    expect(
+      await db.membership.findFirst({ where: { userId: member.id, organizationId: orgId } })
+    ).toBeNull();
+  });
+
+  it("MEMBER cannot remove the OWNER via DELETE membership route (403)", async () => {
+    const ownerMembershipId = (
+      await db.membership.findFirstOrThrow({ where: { userId: owner.id, organizationId: orgId } })
+    ).id;
+    const res = await memberDeleteRoute(
+      authed(`/api/orgs/${slug}/members/${ownerMembershipId}`, memberSession, {
+        method: "DELETE",
+      }),
+      ctx({ slug, membershipId: ownerMembershipId })
+    );
+    expect(res.status).toBe(403);
+    expect(
+      await db.membership.findFirst({ where: { userId: owner.id, organizationId: orgId } })
+    ).not.toBeNull();
+  });
+
+  it("outsider cannot remove via DELETE membership route (404, no existence leak)", async () => {
+    const membershipId = (
+      await db.membership.findFirstOrThrow({ where: { userId: member.id, organizationId: orgId } })
+    ).id;
+    const res = await memberDeleteRoute(
+      authed(`/api/orgs/${slug}/members/${membershipId}`, outsiderSession, {
+        method: "DELETE",
+      }),
+      ctx({ slug, membershipId })
+    );
+    expect(res.status).toBe(404);
+    expect(
+      await db.membership.findFirst({ where: { userId: member.id, organizationId: orgId } })
+    ).not.toBeNull();
   });
 
   it("create org: creator becomes OWNER; rate limited per user", async () => {

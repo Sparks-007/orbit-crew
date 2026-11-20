@@ -29,6 +29,16 @@ All notable changes to Orbit Crew are documented in this file. The format is bas
 - PostgreSQL 16.15 compatibility exercised end-to-end: schema validation, fresh-database initialization from the schema, unique constraints / indexes / CASCADE foreign keys verified on the server, and the full functional suite (registration, login, organizations, memberships, switching, role changes, ownership transfer, cross-tenant restrictions, concurrent transfers) — 99/99 passing on both SQLite and PostgreSQL.
 - Production runtime verified over HTTP: fail-fast boot without secrets, health probe, register/session flows with HttpOnly + Secure cookies.
 
+### Fixed — CI in clean environments
+
+The first GitHub Actions run failed three of four jobs (`quality`, `tests-sqlite`, `build`; `tests-postgres` passed). Root cause: Bun skips `@prisma/client`'s `postinstall` generation unless the packages are trusted, so clean checkouts had no generated Prisma Client. All fixes verified locally from a wiped `node_modules`, with 99/99 tests passing on SQLite and PostgreSQL 16.
+
+- `trustedDependencies` declared for `@prisma/client` and `@prisma/engines` (`package.json`, `bun.lock`), so a clean `bun install --frozen-lockfile` generates the Prisma Client.
+- Explicit `prisma generate` added to the CI `quality` job (before lint/typecheck) and `build` job (before `next build`, which type-checks since `ignoreBuildErrors` was removed).
+- `test:sqlite` now selects the SQLite provider (`scripts/db-provider.mjs sqlite`) before applying the schema and generates the SQLite client explicitly before running vitest — provider switching and client generation remain correctly ordered.
+- `prisma validate` in the `quality` job now receives a SQLite placeholder `DATABASE_URL` (`file:./dev.db`) — the CLI requires the variable to be defined even though validation never connects, and clean CI checkouts have no `.env`.
+- `public/*.zip` added to `.gitignore` so delivered patch archives can never be committed.
+
 ## [0.1.0] — 2026-11-17
 
 ### M1 — Project Foundation

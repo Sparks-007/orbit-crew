@@ -5,7 +5,7 @@ Status: M1 — Project Foundation (v0.1.0, 2026-11-17).
 ## Current state (sandbox)
 
 - Provider: **SQLite** through Prisma (`datasource db { provider = "sqlite" }` in `prisma/schema.prisma`).
-- Location: `DATABASE_URL=file:/home/z/my-project/db/custom.db` (see `.env.example`). The `db/` directory is gitignored.
+- Location: `DATABASE_URL=file:../db/custom.db` (see `.env.example`). Prisma resolves `file:` URLs relative to the directory containing `prisma/schema.prisma`, so this points to `<project root>/db/custom.db`. The `db/` directory is gitignored.
 - Schema management: `bun run db:push` (declarative push with `--accept-data-loss`) — acceptable for sandbox iteration; migrations are adopted at the PostgreSQL switch. **No committed migrations exist yet** — a fresh database is initialized from the schema via `db push`, which is the exact path the CI PostgreSQL job exercises.
 
 ## PostgreSQL verification (2026-11-18 audit)
